@@ -1,0 +1,51 @@
+# Private source data and internal artifacts
+private-data/
+local-data/
+*Purchase/
+*data /
+*.xls
+*.xlsx
+*.csv
+*.db
+*.db-*
+*.pdf
+*.png
+test_runs/
+_charts/
+
+# Legacy internal material retained locally, never published
+*_Agent_Instructions_*.md
+*_System_Instructions.md
+README_*Persistence.md
+README_Supabase.md
+comprehensive_review.jsx
+ARCHITECTURE_AND_IMPLEMENTATION_PLAN.md
+METHODOLOGY_RESEARCH_AND_VALIDATION_PLAN.md
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Generated application output
+output/
+reports/
+artifacts/
