@@ -1,0 +1,37 @@
+name: Bug report
+description: Report reproducible incorrect behavior using synthetic data only.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach customer data, credentials, or production reports.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Synthetic reproduction
+      description: Provide minimal steps or synthetic input that reproduce the issue.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: privacy
+    attributes:
+      label: Data confirmation
+      options:
+        - I confirm this report contains no private or production data.
+    validations:
+      required: true
+

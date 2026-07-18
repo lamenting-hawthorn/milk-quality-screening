@@ -10,7 +10,6 @@ import pandas as pd
 import build_report
 import pipeline
 
-
 MONTH_STATS_COLUMNS = [
     "facility", "dcs", "society_name", "file_year", "file_month", "season",
     "record_count", "morning_count", "evening_count", "low_qty_count",

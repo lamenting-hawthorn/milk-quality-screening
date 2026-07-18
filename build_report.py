@@ -1,10 +1,9 @@
 """Render a milk quality screening PDF from a canonical report bundle."""
 import json
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 import pandas as pd
-
 
 ROOT = Path(__file__).resolve().parent
 BRAND = "#1f4e79"

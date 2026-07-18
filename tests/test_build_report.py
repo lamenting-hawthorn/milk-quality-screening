@@ -1,11 +1,3 @@
-import sys
-from pathlib import Path
-
-
-SNF_ROOT = Path(__file__).resolve().parents[1]
-if str(SNF_ROOT) not in sys.path:
-    sys.path.insert(0, str(SNF_ROOT))
-
 import build_report
 import pipeline
 
