@@ -1,0 +1,870 @@
+"""Milk quality screening analysis library.
+
+Parses one monthly workbook, computes compact monthly society stats, derives
+historical baselines from prior monthly stats, detects anomalies for societies
+with enough history, and builds one canonical analysis bundle used by both the
+human PDF report and Supabase persistence.
+"""
+import argparse
+import datetime as _dt
+import json
+import re
+import sqlite3
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "data" / "input"
+DB = ROOT / "data" / "screening.db"
+SUMMER = {4, 5, 6, 7, 8, 9}
+MIN_TOTAL_PRIOR_MONTHS = 3
+MIN_SAME_SEASON_PRIOR_MONTHS = 2
+
+MONTH_MAP = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+COLMAP_A = {
+    "S.NO.": "serial_no",
+    "VCH.": "vehicle",
+    "DATE": "date",
+    "SHIFT.": "shift",
+    "DCS": "dcs",
+    "SOCIETY NAME": "society_name",
+    "QTY": "qty",
+    "Fat %": "fat_pct",
+    "Snf %": "snf_pct",
+    "CLR": "clr",
+    "Kg, Fat": "kg_fat",
+    "Kg. Snf": "kg_snf",
+    "Rate": "rate",
+    "Amount": "amount",
+}
+
+COLMAP_B = {
+    "Sl No": "serial_no",
+    "Veh No.": "vehicle",
+    "Date": "date",
+    "Shift": "shift",
+    "DCS No.": "dcs",
+    "Society Name": "society_name",
+    "Qty": "qty",
+    "Fat %": "fat_pct",
+    "Snf %": "snf_pct",
+    "Clr": "clr",
+    "Kg. Fat": "kg_fat",
+    "Kg. Snf": "kg_snf",
+    "Rate": "rate",
+    "Amount": "amount",
+}
+
+KEEP = [
+    "serial_no",
+    "vehicle",
+    "date",
+    "shift",
+    "dcs",
+    "society_name",
+    "qty",
+    "fat_pct",
+    "snf_pct",
+    "clr",
+    "kg_fat",
+    "kg_snf",
+    "rate",
+    "amount",
+]
+
+METRICS = ["fat_pct", "snf_pct", "clr", "qty"]
+METHODOLOGY_VERSION = "screening-v1-safety"
+SCREENING_DISCLAIMER = (
+    "This system prioritizes records for review and confirmatory testing. "
+    "It does not identify an adulterant, establish intent, or prove fraud."
+)
+FLAG_COLUMNS = [
+    "facility",
+    "dcs",
+    "society_name",
+    "date",
+    "shift",
+    "vehicle",
+    "qty",
+    "fat_pct",
+    "snf_pct",
+    "clr",
+    "z_fat",
+    "z_snf",
+    "z_clr",
+    "z_qty",
+    "R1_snf_drop",
+    "R2_snf_spike",
+    "R3_fat_drop",
+    "R4_ratio_break",
+    "R5_clr_spike",
+    "R6_dilution",
+    "R7_clr_drop",
+    "R8_repeated_spike",
+    "low_seasonal_data",
+    "file_month",
+    "file_year",
+    "b_fat",
+    "b_snf",
+    "b_clr",
+    "b_qty",
+    "season",
+    "direction",
+    "num_dir",
+    "total_active",
+    "pct_flagged",
+    "seasonal_likely",
+    "diagnosis",
+    "confidence",
+    "case",
+    "explanation",
+    "confidence_base",
+    "confidence_note",
+]
+
+
+def season_for_month(month):
+    return "summer" if int(month) in SUMMER else "winter"
+
+
+def parse_filename(fn):
+    base = Path(fn).name
+    facility = base.split()[0]
+    match = re.search(r"month of\s+([A-Za-z]+)\s+(\d{4})", base, re.I)
+    if not match:
+        return None
+    return facility, MONTH_MAP[match.group(1).lower()], int(match.group(2))
+
+
+def normalize_collection_frame(df, facility, month, year):
+    cmap = COLMAP_A if "S.NO." in df.columns else COLMAP_B
+    df = df.rename(columns=cmap)
+    columns = [column for column in KEEP if column in df.columns]
+    df = df[columns].copy()
+    required = {"serial_no", "date", "shift", "dcs", "society_name", "qty", "fat_pct", "snf_pct", "clr"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns after normalization: {sorted(missing)}")
+    df = df[df["serial_no"].notna()]
+    for column in ["qty", "fat_pct", "snf_pct", "clr", "kg_fat", "kg_snf", "rate", "amount", "dcs"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = df.dropna(subset=["dcs", "fat_pct", "snf_pct", "clr", "qty"])
+    df["society_name"] = df["society_name"].astype(str).str.strip()
+    df["shift"] = df["shift"].astype(str).str.strip().str.upper().str[0]
+    df["vehicle"] = df["vehicle"].astype(str).str.strip()
+    df["facility"] = facility
+    df["file_month"] = int(month)
+    df["file_year"] = int(year)
+    df["season"] = season_for_month(month)
+    return df
+
+
+def load_file(path):
+    parsed = parse_filename(path)
+    if parsed is None:
+        return None
+    facility, month, year = parsed
+    frame = pd.read_excel(path, engine="xlrd")
+    return normalize_collection_frame(frame, facility, month, year)
+
+
+def load_all(source_dir=SRC):
+    frames = []
+    for path in sorted(Path(source_dir).rglob("*.xls")):
+        frame = load_file(path)
+        if frame is not None and len(frame):
+            frames.append(frame)
+    if not frames:
+        raise FileNotFoundError(f"No readable .xls files found in {source_dir}")
+    return pd.concat(frames, ignore_index=True)
+
+
+def _safe_std(values):
+    if len(values) <= 1:
+        return 0.0
+    std = values.std()
+    return 0.0 if pd.isna(std) else float(std)
+
+
+def _metric_summary(values):
+    values = values.dropna()
+    if not len(values):
+        return {name: None for name in ["mean", "std", "median", "q1", "q3", "p90", "p10", "min", "max"]}
+    return {
+        "mean": float(values.mean()),
+        "std": _safe_std(values),
+        "median": float(values.median()),
+        "q1": float(values.quantile(0.25)),
+        "q3": float(values.quantile(0.75)),
+        "p90": float(values.quantile(0.90)),
+        "p10": float(values.quantile(0.10)),
+        "min": float(values.min()),
+        "max": float(values.max()),
+    }
+
+
+def compute_society_month_stats(df, source_name="", parser_warning_count=0):
+    rows = []
+    processed_at = pd.Timestamp.now(tz="UTC").isoformat()
+    for (facility, dcs, file_year, file_month), group in df.groupby(["facility", "dcs", "file_year", "file_month"]):
+        row = {
+            "facility": facility,
+            "dcs": dcs,
+            "society_name": group["society_name"].mode().iloc[0],
+            "file_year": int(file_year),
+            "file_month": int(file_month),
+            "season": group["season"].iloc[0],
+            "record_count": int(len(group)),
+            "morning_count": int((group["shift"] == "M").sum()),
+            "evening_count": int((group["shift"] == "E").sum()),
+            "low_qty_count": int((group["qty"] < 10).sum()),
+            "filename": Path(source_name).name if source_name else "",
+            "processed_at": processed_at,
+            "parser_warning_count": int(parser_warning_count),
+        }
+        snf_p90 = group["snf_pct"].quantile(0.90) if len(group) else None
+        row["high_snf_spike_count"] = int((group["snf_pct"] > snf_p90).sum()) if snf_p90 is not None else 0
+        for metric in METRICS:
+            summary = _metric_summary(group[metric])
+            for suffix, value in summary.items():
+                row[f"{metric}_{suffix}"] = value
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _pooled_std(means, stds, counts):
+    total = int(counts.sum())
+    if total <= 1:
+        return 0.0
+    weighted_mean = float(np.average(means, weights=counts))
+    numerator = 0.0
+    for mean, std, count in zip(means, stds, counts):
+        variance = 0.0 if pd.isna(std) else float(std) ** 2
+        numerator += max(int(count) - 1, 0) * variance
+        numerator += int(count) * (float(mean) - weighted_mean) ** 2
+    return float(np.sqrt(numerator / max(total - 1, 1)))
+
+
+def _baseline_from_month_groups(facility, dcs, season, group, total_prior_months, same_season_prior_months):
+    total_records = int(group["record_count"].sum())
+    row = {
+        "facility": facility,
+        "dcs": dcs,
+        "society_name": group["society_name"].mode().iloc[0],
+        "season": season,
+        "record_count": total_records,
+        "prior_month_count": int(total_prior_months),
+        "same_season_prior_month_count": int(same_season_prior_months),
+        "eligible": int(total_prior_months >= MIN_TOTAL_PRIOR_MONTHS and (season == "all" or same_season_prior_months >= MIN_SAME_SEASON_PRIOR_MONTHS)),
+    }
+    counts = group["record_count"].astype(float)
+    for metric in METRICS:
+        means = group[f"{metric}_mean"].astype(float)
+        stds = group[f"{metric}_std"].fillna(0).astype(float)
+        row[f"{metric}_mean"] = float(np.average(means, weights=counts)) if len(group) else None
+        row[f"{metric}_std"] = _pooled_std(means, stds, counts)
+        row[f"{metric}_median"] = float(group[f"{metric}_median"].median())
+        row[f"{metric}_q1"] = float(group[f"{metric}_q1"].median())
+        row[f"{metric}_q3"] = float(group[f"{metric}_q3"].median())
+        row[f"{metric}_p90"] = float(group[f"{metric}_p90"].mean())
+        row[f"{metric}_p10"] = float(group[f"{metric}_p10"].mean())
+        if metric == "snf_pct" and row["snf_pct_std"] and row["snf_pct_std"] > 0.5:
+            trimmed = group[
+                (group["snf_pct_mean"] >= group["snf_pct_q1"]) &
+                (group["snf_pct_mean"] <= group["snf_pct_q3"])
+            ]
+            if len(trimmed) >= 2:
+                trim_counts = trimmed["record_count"].astype(float)
+                row["snf_pct_mean"] = float(np.average(trimmed["snf_pct_mean"].astype(float), weights=trim_counts))
+                row["snf_pct_std"] = _pooled_std(
+                    trimmed["snf_pct_mean"].astype(float),
+                    trimmed["snf_pct_std"].fillna(0).astype(float),
+                    trim_counts,
+                )
+    return row
+
+
+def build_baselines_from_month_stats(month_stats_df, target_year, target_month):
+    if month_stats_df is None or not len(month_stats_df):
+        return pd.DataFrame()
+    stats = month_stats_df.copy()
+    stats["ym"] = stats["file_year"].astype(int) * 100 + stats["file_month"].astype(int)
+    target_ym = int(target_year) * 100 + int(target_month)
+    prior = stats[stats["ym"] < target_ym].copy()
+    if not len(prior):
+        return pd.DataFrame()
+    rows = []
+    for (facility, dcs), all_group in prior.groupby(["facility", "dcs"]):
+        total_prior_months = len(all_group)
+        rows.append(_baseline_from_month_groups(facility, dcs, "all", all_group, total_prior_months, len(all_group[all_group["season"] == season_for_month(target_month)])))
+        for season, season_group in all_group.groupby("season"):
+            rows.append(_baseline_from_month_groups(facility, dcs, season, season_group, total_prior_months, len(season_group)))
+    return pd.DataFrame(rows)
+
+
+def build_baselines(df):
+    rows = []
+    for (facility, dcs, season), group in df.groupby(["facility", "dcs", "season"]):
+        if len(group) < 10:
+            continue
+        rows.append(_legacy_baseline_row(facility, dcs, season, group))
+    for (facility, dcs), group in df.groupby(["facility", "dcs"]):
+        if len(group) < 10:
+            continue
+        rows.append(_legacy_baseline_row(facility, dcs, "all", group))
+    return pd.DataFrame(rows)
+
+
+def _legacy_baseline_row(facility, dcs, season, group):
+    row = {"facility": facility, "dcs": dcs, "society_name": group["society_name"].mode().iloc[0], "season": season, "record_count": len(group), "eligible": 1}
+    for metric in METRICS:
+        summary = _metric_summary(group[metric])
+        for suffix, value in summary.items():
+            row[f"{metric}_{suffix}"] = value
+        if metric == "snf_pct" and row["snf_pct_std"] and row["snf_pct_std"] > 0.5:
+            trimmed = group[(group["snf_pct"] >= row["snf_pct_q1"]) & (group["snf_pct"] <= row["snf_pct_q3"])]["snf_pct"]
+            if len(trimmed) >= 5:
+                row["snf_pct_mean"] = float(trimmed.mean())
+                row["snf_pct_std"] = _safe_std(trimmed)
+    return row
+
+
+def _empty_flagged_frame():
+    return pd.DataFrame(columns=FLAG_COLUMNS)
+
+
+def zscore(value, mean, std):
+    return 0.0 if std in (None, 0) or pd.isna(std) else (value - mean) / std
+
+
+def apply_rules(df, baselines):
+    if baselines is None or not len(baselines):
+        return _empty_flagged_frame()
+    lookup = {(row["facility"], row["dcs"], row["season"]): row for _, row in baselines.iterrows()}
+    flagged_rows = []
+    for record in df.itertuples(index=False):
+        baseline = lookup.get((record.facility, record.dcs, record.season))
+        low_seasonal = 0
+        if baseline is None or int(baseline.get("eligible", 1)) == 0 or baseline["record_count"] < 15:
+            fallback = lookup.get((record.facility, record.dcs, "all"))
+            if fallback is None or int(fallback.get("eligible", 1)) == 0 or fallback["record_count"] < 30:
+                continue
+            baseline = fallback
+            low_seasonal = 1
+        thin = baseline["record_count"] < 30
+        z_fat = zscore(record.fat_pct, baseline["fat_pct_mean"], baseline["fat_pct_std"])
+        z_snf = zscore(record.snf_pct, baseline["snf_pct_mean"], baseline["snf_pct_std"])
+        z_clr = zscore(record.clr, baseline["clr_mean"], baseline["clr_std"])
+        z_qty = zscore(record.qty, baseline["qty_mean"], baseline["qty_std"])
+
+        r1 = int(z_snf < -2.0 and record.snf_pct < 8.0)
+        r2 = int(z_snf > 2.0 and record.snf_pct > 9.2)
+        r3 = int(z_fat < -2.5 and record.fat_pct < (baseline["fat_pct_mean"] - 2.0))
+        r4 = int(z_snf > 1.5 and z_fat < -0.5 and record.snf_pct > 9.0)
+        r5 = int(z_clr > 2.0 and record.clr >= 29)
+        r6 = int(z_qty > 2.0 and (z_fat < -1.5 or z_snf < -1.5))
+        r7 = int(z_clr < -2.0 and record.clr < 25)
+
+        if thin:
+            keep_any = any([z_snf < -3.5, z_snf > 3.5, z_fat < -3.5, z_fat > 3.5, z_clr < -3.5, z_clr > 3.5])
+            if not keep_any:
+                r1 = r2 = r3 = r4 = r5 = r6 = r7 = 0
+
+        if any([r1, r2, r3, r4, r5, r6, r7]):
+            flagged_rows.append({
+                "facility": record.facility,
+                "dcs": record.dcs,
+                "society_name": record.society_name,
+                "date": record.date,
+                "shift": record.shift,
+                "vehicle": record.vehicle,
+                "qty": record.qty,
+                "fat_pct": record.fat_pct,
+                "snf_pct": record.snf_pct,
+                "clr": record.clr,
+                "z_fat": z_fat,
+                "z_snf": z_snf,
+                "z_clr": z_clr,
+                "z_qty": z_qty,
+                "R1_snf_drop": r1,
+                "R2_snf_spike": r2,
+                "R3_fat_drop": r3,
+                "R4_ratio_break": r4,
+                "R5_clr_spike": r5,
+                "R6_dilution": r6,
+                "R7_clr_drop": r7,
+                "R8_repeated_spike": 0,
+                "low_seasonal_data": low_seasonal,
+                "file_month": record.file_month,
+                "file_year": record.file_year,
+                "b_fat": baseline["fat_pct_mean"],
+                "b_snf": baseline["snf_pct_mean"],
+                "b_clr": baseline["clr_mean"],
+                "b_qty": baseline["qty_mean"],
+                "season": record.season,
+            })
+    flagged = pd.DataFrame(flagged_rows) if flagged_rows else _empty_flagged_frame()
+
+    # R8 is intentionally disabled. A fixed count above p90 has a high null
+    # probability for societies with many collections and is not exposure-aware.
+    # The column remains in the compatibility schema and is always zero.
+    return flagged if len(flagged) else _empty_flagged_frame()
+
+
+def diagnose(row):
+    if row.get("R6_dilution", 0) == 1:
+        return ("VOLUME_COMPOSITION_SHIFT", "RESAMPLE", "S6")
+    if row.get("R1_snf_drop", 0) == 1 and row.get("R7_clr_drop", 0) == 1:
+        return ("LOW_DENSITY_COMPOSITION_SCREEN", "RESAMPLE", "S1_7")
+    if row.get("R2_snf_spike", 0) == 1 and row.get("R5_clr_spike", 0) == 1:
+        return ("HIGH_DENSITY_COMPOSITION_SCREEN", "RESAMPLE", "S2_5")
+    rules = (
+        ("R7_clr_drop", "LOW_DENSITY_SCREEN", "S7"),
+        ("R5_clr_spike", "HIGH_DENSITY_SCREEN", "S5"),
+        ("R3_fat_drop", "LOW_FAT_SCREEN", "S3"),
+        ("R1_snf_drop", "LOW_SOLIDS_SCREEN", "S1"),
+        ("R2_snf_spike", "HIGH_SOLIDS_SCREEN", "S2"),
+        ("R4_ratio_break", "COMPOSITION_RELATIONSHIP_SCREEN", "S4"),
+    )
+    for rule, category, case in rules:
+        if row.get(rule, 0) == 1:
+            return (category, "REVIEW", case)
+    if row.get("R8_repeated_spike", 0) == 1:
+        return ("LEGACY_RULE_DISABLED", "MONITOR", "S_LEGACY")
+    return ("UNCLASSIFIED_SCREENING_SIGNAL", "MONITOR", "S0")
+
+
+def explain(row, diagnosis):
+    return (
+        f"SNF {row['snf_pct']:.2f}% (base {row['b_snf']:.2f}, z={row['z_snf']:+.1f}); "
+        f"Fat {row['fat_pct']:.2f}% (base {row['b_fat']:.2f}, z={row['z_fat']:+.1f}); "
+        f"CLR {row['clr']:.1f} (base {row['b_clr']:.1f}, z={row['z_clr']:+.1f}); "
+        f"QTY {row['qty']:.1f} (base {row['b_qty']:.1f}, z={row['z_qty']:+.1f}). "
+        f"Screening category: {diagnosis}. Confirmatory testing is required."
+    )
+
+
+def downgrade_confidence(confidence):
+    order = ["MONITOR", "REVIEW", "RESAMPLE"]
+    if confidence not in order:
+        return confidence
+    return order[max(0, order.index(confidence) - 1)]
+
+
+def apply_confidence_adjustments(flagged):
+    if not len(flagged):
+        return flagged
+    adjusted = flagged.copy()
+    adjusted["confidence_base"] = adjusted["confidence"]
+    notes = []
+    for idx, row in adjusted.iterrows():
+        confidence = row["confidence"]
+        row_notes = []
+        if pd.notna(row.get("qty")) and row.get("qty") < 10:
+            confidence = downgrade_confidence(confidence)
+            row_notes.append("screening priority reduced for QTY < 10L")
+        if row.get("low_seasonal_data", 0) == 1 and confidence == "RESAMPLE":
+            confidence = "REVIEW"
+            row_notes.append("screening priority capped because same-season history is thin")
+        adjusted.at[idx, "confidence"] = confidence
+        notes.append("; ".join(row_notes))
+    adjusted["confidence_note"] = notes
+    needs_note = adjusted["confidence_note"].astype(str).str.len() > 0
+    adjusted.loc[needs_note, "explanation"] = adjusted.loc[needs_note, "explanation"] + " Note: " + adjusted.loc[needs_note, "confidence_note"] + "."
+    return adjusted
+
+
+def seasonal_filter(flagged, all_records):
+    if not len(flagged):
+        flagged["seasonal_likely"] = 0
+        flagged["pct_flagged"] = 0.0
+        return flagged
+    active = all_records.groupby(["facility", "date", "shift"])["dcs"].nunique().rename("total_active").reset_index()
+    flagged["direction"] = np.where(
+        (flagged["z_snf"] < -1) | (flagged["z_fat"] < -1) | (flagged["z_clr"] < -1),
+        "down",
+        np.where((flagged["z_snf"] > 1) | (flagged["z_clr"] > 1), "up", "mixed"),
+    )
+    counts = flagged.groupby(["facility", "date", "shift", "direction"])["dcs"].nunique().rename("num_dir").reset_index()
+    flagged = flagged.merge(counts, on=["facility", "date", "shift", "direction"], how="left")
+    flagged = flagged.merge(active, on=["facility", "date", "shift"], how="left")
+    flagged["pct_flagged"] = flagged["num_dir"] / flagged["total_active"] * 100
+    flagged["seasonal_likely"] = (flagged["pct_flagged"] > 30).astype(int)
+    return flagged
+
+
+def build_daily_summary(flagged, all_records):
+    active = all_records.groupby(["facility", "date", "shift"])["dcs"].nunique().rename("total_active").reset_index()
+    if len(flagged):
+        counts = flagged.groupby(["facility", "date", "shift"])["dcs"].nunique().rename("num_flagged").reset_index()
+        daily = active.merge(counts, on=["facility", "date", "shift"], how="left")
+    else:
+        daily = active.copy()
+        daily["num_flagged"] = 0
+    daily["num_flagged"] = daily["num_flagged"].fillna(0).astype(int)
+    daily["pct_flagged"] = daily["num_flagged"] / daily["total_active"] * 100
+    daily["seasonal_event"] = (daily["pct_flagged"] > 30).astype(int)
+    return daily
+
+
+def build_severity(report):
+    if not len(report):
+        return pd.DataFrame(columns=["facility", "dcs", "society_name", "flags", "severity", "primary_diagnosis"])
+    ym = report["file_year"] * 100 + report["file_month"]
+    cutoff = sorted(ym.unique())[-6] if len(ym.unique()) >= 6 else ym.min()
+    recent = report[ym >= cutoff]
+    severity = recent.groupby(["facility", "dcs", "society_name"]).size().rename("flags").reset_index()
+    def level(count):
+        if count >= 30:
+            return "VERY_FREQUENT"
+        if count >= 15:
+            return "FREQUENT"
+        if count >= 8:
+            return "RECURRING"
+        return "ISOLATED"
+    severity["severity"] = severity["flags"].apply(level)
+    primary = recent.groupby(["facility", "dcs", "society_name"])["diagnosis"].agg(lambda s: s.mode().iloc[0] if len(s.mode()) else s.iloc[0]).rename("primary_diagnosis").reset_index()
+    return severity.merge(primary, on=["facility", "dcs", "society_name"], how="left")
+
+
+def build_month_summaries(df, flagged, report, mode="detection"):
+    rows = []
+    for (facility, year, month), group in df.groupby(["facility", "file_year", "file_month"]):
+        if len(flagged) and "facility" in flagged.columns:
+            all_month = flagged[(flagged["facility"] == facility) & (flagged["file_year"] == year) & (flagged["file_month"] == month)]
+        else:
+            all_month = pd.DataFrame()
+        if len(report) and "facility" in report.columns:
+            final_month = report[(report["facility"] == facility) & (report["file_year"] == year) & (report["file_month"] == month)]
+        else:
+            final_month = pd.DataFrame()
+        rows.append({
+            "facility": facility,
+            "file_month": int(month),
+            "file_year": int(year),
+            "records_processed": int(len(group)),
+            "societies_active": int(group["dcs"].nunique()),
+            "initial_flags": int(len(all_month)),
+            "seasonal_suppressed": int(all_month["seasonal_likely"].sum()) if len(all_month) else 0,
+            "final_flags": int(len(final_month)),
+            "high_confidence_flags": int((final_month["confidence"] == "RESAMPLE").sum()) if len(final_month) else 0,
+            "priority_resample_flags": int((final_month["confidence"] == "RESAMPLE").sum()) if len(final_month) else 0,
+            "top_diagnosis": final_month["diagnosis"].mode().iloc[0] if len(final_month) else "",
+            "top_screening_category": final_month["diagnosis"].mode().iloc[0] if len(final_month) else "",
+            "top_flagged_societies": (
+                final_month.groupby(["dcs", "society_name"])
+                .agg(flags=("diagnosis", "size"), primary_diagnosis=("diagnosis", lambda s: s.mode().iloc[0]))
+                .sort_values("flags", ascending=False)
+                .head(5)
+                .reset_index()
+                .to_dict("records")
+                if len(final_month)
+                else []
+            ),
+            "notes": "Calibration / insufficient history" if mode != "detection" else "",
+            "mode": mode,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_audit_trail(df, flagged, report, mode="detection"):
+    return pd.DataFrame(
+        [
+            {"facility": "ALL", "file_month": None, "file_year": None, "metric": "records_processed", "value": int(len(df)), "mode": mode},
+            {"facility": "ALL", "file_month": None, "file_year": None, "metric": "societies_active", "value": int(df.groupby(["facility", "dcs"]).ngroups), "mode": mode},
+            {"facility": "ALL", "file_month": None, "file_year": None, "metric": "initial_flags", "value": int(len(flagged)), "mode": mode},
+            {"facility": "ALL", "file_month": None, "file_year": None, "metric": "seasonal_suppressed", "value": int(flagged["seasonal_likely"].sum()) if len(flagged) else 0, "mode": mode},
+            {"facility": "ALL", "file_month": None, "file_year": None, "metric": "final_flags", "value": int(len(report)), "mode": mode},
+        ]
+    )
+
+
+def build_calibration_watchlist(month_stats):
+    if not len(month_stats):
+        return []
+    rows = []
+    facility_summary = month_stats.groupby("facility").agg(
+        fat_mean=("fat_pct_mean", "mean"),
+        fat_std=("fat_pct_mean", lambda s: 0.0 if len(s) <= 1 else float(s.std())),
+        snf_mean=("snf_pct_mean", "mean"),
+        snf_std=("snf_pct_mean", lambda s: 0.0 if len(s) <= 1 else float(s.std())),
+        clr_mean=("clr_mean", "mean"),
+        clr_std=("clr_mean", lambda s: 0.0 if len(s) <= 1 else float(s.std())),
+    ).reset_index()
+    for _, row in month_stats.iterrows():
+        fac = facility_summary[facility_summary["facility"] == row["facility"]].iloc[0]
+        z_fat = zscore(row["fat_pct_mean"], fac["fat_mean"], fac["fat_std"])
+        z_snf = zscore(row["snf_pct_mean"], fac["snf_mean"], fac["snf_std"])
+        z_clr = zscore(row["clr_mean"], fac["clr_mean"], fac["clr_std"])
+        score = abs(z_fat) + abs(z_snf) + abs(z_clr)
+        rows.append({
+            "facility": row["facility"],
+            "dcs": row["dcs"],
+            "society_name": row["society_name"],
+            "record_count": int(row["record_count"]),
+            "fat_mean": row["fat_pct_mean"],
+            "snf_mean": row["snf_pct_mean"],
+            "clr_mean": row["clr_mean"],
+            "deviation_score": round(float(score), 2),
+        })
+    rows.sort(key=lambda item: item["deviation_score"], reverse=True)
+    return rows[:15]
+
+
+def _jsonable(value):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return None if pd.isna(value) else float(value)
+    if isinstance(value, (pd.Timestamp,)):
+        return value.isoformat()
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _jsonable(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    return value
+
+
+def build_analysis_bundle(
+    month_df,
+    month_stats,
+    historical_month_stats,
+    baselines,
+    flagged,
+    report,
+    daily,
+    severity,
+    source_name="",
+    mode="detection",
+):
+    facilities = sorted(month_df["facility"].dropna().unique().tolist())
+    facility = facilities[0] if len(facilities) == 1 else "ALL"
+    file_year = int(month_df["file_year"].iloc[0])
+    file_month = int(month_df["file_month"].iloc[0])
+    sections = {}
+    diagnosis_counts = report["diagnosis"].value_counts().to_dict() if len(report) else {}
+    severity_rows = severity.to_dict("records") if len(severity) else []
+    watchlist = build_calibration_watchlist(month_stats)
+    baseline_snapshot = baselines[["facility", "dcs", "society_name", "season", "record_count", "prior_month_count", "same_season_prior_month_count", "eligible"]].to_dict("records") if len(baselines) else []
+    sections["executive_summary"] = {
+        "title": "Executive Summary",
+        "mode": mode,
+        "summary": (
+            f"Calibration report for {facility} {file_year}-{file_month:02d}; history is not yet sufficient for record-level screening."
+            if mode != "detection"
+            else f"Prioritized {len(report)} records for review for {facility} {file_year}-{file_month:02d}."
+        ),
+        "top_findings": severity_rows[:8] if len(severity_rows) else watchlist[:8],
+    }
+    sections["audit_trail"] = {
+        "title": "Audit Trail",
+        "initial_flags": int(len(flagged)),
+        "seasonal_suppressed": int(flagged["seasonal_likely"].sum()) if len(flagged) else 0,
+        "final_flags": int(len(report)),
+        "mode": mode,
+    }
+    sections["facility_overview"] = {
+        "title": "Facility Overview",
+        "facility_metrics": month_df.groupby("facility").agg(
+            records=("qty", "size"),
+            societies=("dcs", "nunique"),
+            avg_fat=("fat_pct", "mean"),
+            avg_snf=("snf_pct", "mean"),
+            avg_clr=("clr", "mean"),
+        ).round(2).reset_index().to_dict("records"),
+    }
+    sections["diagnosis_distribution"] = {
+        "title": "Screening Category Distribution",
+        "counts": diagnosis_counts,
+        "confidence_counts": report["confidence"].value_counts().to_dict() if len(report) else {},
+    }
+    sections["screening_distribution"] = sections["diagnosis_distribution"]
+    sections["top_offenders"] = {
+        "title": "Top Screening Signals by Society",
+        "rows": (
+            report.groupby(["facility", "dcs", "society_name", "diagnosis"]).size().rename("count").reset_index().sort_values("count", ascending=False).head(15).to_dict("records")
+            if len(report)
+            else []
+        ),
+    }
+    details = report.copy()
+    if len(details):
+        details = details[~((details["diagnosis"] == "UNCLASSIFIED_SCREENING_SIGNAL") & (details["confidence"] == "MONITOR") & (details["z_snf"].abs() <= 1.5) & (details["z_fat"].abs() <= 1.5) & (details["z_clr"].abs() <= 1.5))]
+    sections["detail_logs"] = {"title": "Detail Logs", "rows": details.to_dict("records") if len(details) else []}
+    sections["action_plan"] = {
+        "title": "Action Plan",
+        "actions": [
+            {"diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "action": "Collect a controlled resample; verify temperature-corrected CLR and reference fat/SNF measurements."},
+            {"diagnosis": "HIGH_DENSITY_COMPOSITION_SCREEN", "action": "Collect a controlled resample and select a confirmatory laboratory panel based on chain-of-custody evidence."},
+            {"diagnosis": "LOW_FAT_SCREEN", "action": "Repeat the fat measurement with a reference method and verify milk class and sampling procedure."},
+            {"diagnosis": "VOLUME_COMPOSITION_SHIFT", "action": "Verify collection records, route context, and sampling integrity before controlled resampling."},
+            {"diagnosis": "COMPOSITION_RELATIONSHIP_SCREEN", "action": "Review instrument calibration, formula use, and measurement provenance."},
+        ],
+    }
+    sections["methodology"] = {
+        "title": "Methodology Summary",
+        "rules": [
+            {"id": "R1", "trigger": "z_snf < -2.0 and SNF < 8.0"},
+            {"id": "R2", "trigger": "z_snf > 2.0 and SNF > 9.2"},
+            {"id": "R3", "trigger": "z_fat < -2.5 and Fat < baseline - 2.0"},
+            {"id": "R4", "trigger": "z_snf > 1.5 and z_fat < -0.5 and SNF > 9.0"},
+            {"id": "R5", "trigger": "z_clr > 2.0 and CLR >= 29"},
+            {"id": "R6", "trigger": "z_qty > 2.0 and (z_fat < -1.5 or z_snf < -1.5)"},
+            {"id": "R7", "trigger": "z_clr < -2.0 and CLR < 25"},
+        ],
+        "disabled_rules": [{"id": "R8", "reason": "Fixed exceedance count is not exposure-aware and has an unacceptably high null probability."}],
+        "intended_use": SCREENING_DISCLAIMER,
+        "baseline_policy": {
+            "minimum_total_prior_months": MIN_TOTAL_PRIOR_MONTHS,
+            "minimum_same_season_prior_months": MIN_SAME_SEASON_PRIOR_MONTHS,
+            "mode": mode,
+        },
+    }
+    sections["calibration"] = {
+        "title": "Calibration / Insufficient History",
+        "watchlist": watchlist,
+        "eligible_societies": int(sum(item.get("eligible", 0) for item in baseline_snapshot)),
+        "baseline_snapshot": baseline_snapshot,
+    }
+
+    bundle = {
+        "methodology_version": METHODOLOGY_VERSION,
+        "disclaimer": SCREENING_DISCLAIMER,
+        "legacy_schema": {
+            "diagnosis": "Deprecated compatibility field containing screening_category.",
+            "confidence": "Deprecated compatibility field containing screening_priority.",
+            "severity": "Deprecated compatibility field containing screening frequency.",
+        },
+        "file_identity": {
+            "facility": facility,
+            "facilities": facilities,
+            "file_year": file_year,
+            "file_month": file_month,
+            "season": month_df["season"].iloc[0],
+            "filename": Path(source_name).name if source_name else "",
+        },
+        "processing_metrics": {
+            "records_processed": int(len(month_df)),
+            "societies_active": int(month_df["dcs"].nunique()),
+            "facility_count": int(len(facilities)),
+            "duplicates_removed": 0,
+            "parse_warnings": 0,
+            "mode": mode,
+        },
+        "current_month_stats": month_stats.to_dict("records"),
+        "historical_baselines": baseline_snapshot,
+        "anomaly_records": flagged.to_dict("records") if len(flagged) else [],
+        "report_records": report.to_dict("records") if len(report) else [],
+        "daily_summary": daily.to_dict("records") if len(daily) else [],
+        "severity": severity_rows,
+        "sections": sections,
+        "retrieval": {
+            "summary_text": sections["executive_summary"]["summary"],
+            "top_diagnoses": diagnosis_counts,
+            "top_screening_categories": diagnosis_counts,
+            "mode": mode,
+        },
+        "history_inputs": {
+            "historical_month_stats_count": int(len(historical_month_stats)) if historical_month_stats is not None else 0,
+        },
+    }
+    return _jsonable(bundle)
+
+
+def analyze_month(month_df, historical_month_stats=None, source_name=""):
+    historical_month_stats = historical_month_stats if historical_month_stats is not None else pd.DataFrame()
+    month_stats = compute_society_month_stats(month_df, source_name=source_name)
+    baselines = build_baselines_from_month_stats(historical_month_stats, month_df["file_year"].iloc[0], month_df["file_month"].iloc[0])
+    flagged = apply_rules(month_df, baselines)
+    if len(flagged):
+        flagged = seasonal_filter(flagged, month_df)
+        diagnoses = flagged.apply(diagnose, axis=1, result_type="expand")
+        diagnoses.columns = ["diagnosis", "confidence", "case"]
+        flagged = pd.concat([flagged, diagnoses], axis=1)
+        flagged["explanation"] = flagged.apply(lambda row: explain(row, row["diagnosis"]), axis=1)
+        flagged = apply_confidence_adjustments(flagged)
+    else:
+        flagged = _empty_flagged_frame()
+    report = flagged[flagged["seasonal_likely"] == 0].copy() if len(flagged) else flagged.copy()
+    daily = build_daily_summary(flagged, month_df)
+    severity = build_severity(report)
+    mode = "detection" if len(report) else "seed_only"
+    bundle = build_analysis_bundle(month_df, month_stats, historical_month_stats, baselines, flagged, report, daily, severity, source_name=source_name, mode=mode)
+    month_summaries = build_month_summaries(month_df, flagged, report, mode=mode)
+    audit_trail = build_audit_trail(month_df, flagged, report, mode=mode)
+    return {
+        "month_df": month_df,
+        "month_stats": month_stats,
+        "baselines": baselines,
+        "flagged": flagged,
+        "report": report,
+        "daily_summary": daily,
+        "severity": severity,
+        "month_summaries": month_summaries,
+        "audit_trail": audit_trail,
+        "report_bundle": bundle,
+        "mode": mode,
+    }
+
+
+def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
+    df = load_all(source_dir)
+    result = analyze_month(df, historical_month_stats=pd.DataFrame(), source_name=str(source_dir))
+    con = sqlite3.connect(db_path)
+    result["month_stats"].to_sql("society_month_stats", con, if_exists="replace", index=False)
+    result["baselines"].to_sql("society_baselines", con, if_exists="replace", index=False)
+    result["flagged"].to_sql("flagged_anomalies", con, if_exists="replace", index=False)
+    result["daily_summary"].to_sql("daily_summary", con, if_exists="replace", index=False)
+    result["severity"].to_sql("severity", con, if_exists="replace", index=False)
+    result["month_summaries"].to_sql("month_summaries", con, if_exists="replace", index=False)
+    result["audit_trail"].to_sql("audit_trail", con, if_exists="replace", index=False)
+    pd.DataFrame([{"facility": result["report_bundle"]["file_identity"]["facility"], "file_year": result["report_bundle"]["file_identity"]["file_year"], "file_month": result["report_bundle"]["file_identity"]["file_month"], "bundle_json": json.dumps(result["report_bundle"])}]).to_sql("report_bundles", con, if_exists="replace", index=False)
+    con.close()
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Run milk quality screening on local files.")
+    parser.add_argument("--source-dir", default=str(SRC), help="Directory containing .xls files")
+    parser.add_argument("--db", default=str(DB), help="SQLite database path")
+    args = parser.parse_args(argv)
+    result = run_pipeline(Path(args.source_dir), Path(args.db))
+    print(json.dumps({"facility": result["report_bundle"]["file_identity"]["facility"], "file_month": result["report_bundle"]["file_identity"]["file_month"], "file_year": result["report_bundle"]["file_identity"]["file_year"], "mode": result["mode"], "records_processed": result["processing_metrics"]["records_processed"] if "processing_metrics" in result else len(result["month_df"])}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
