@@ -49,7 +49,7 @@ RULE_COLUMNS = [
 class SupabaseRestClient:
     def __init__(self, url=None, key=None):
         self.url = (url or os.environ.get("SUPABASE_URL") or "").rstrip("/")
-        self.key = key or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
+        self.key = key or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
         if not self.url or not self.key:
             raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY before running.")
 

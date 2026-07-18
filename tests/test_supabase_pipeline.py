@@ -4,6 +4,15 @@ import pytest
 import supabase_pipeline
 
 
+def test_supabase_client_rejects_anonymous_key_fallback(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_ANON_KEY", "public-anonymous-key")
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="SUPABASE_SERVICE_ROLE_KEY"):
+        supabase_pipeline.SupabaseRestClient()
+
+
 class FakeSupabase:
     def __init__(self, duplicate=False, history_rows=None):
         self.duplicate = duplicate
