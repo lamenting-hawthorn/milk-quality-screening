@@ -209,6 +209,45 @@ def test_apply_rules_falls_back_to_all_year_when_seasonal_baseline_is_thin():
     assert row["R7_clr_drop"] == 1
 
 
+def test_run_pipeline_processes_months_in_order_and_uses_prior_history(monkeypatch, tmp_path):
+    rows = []
+    for month in range(1, 5):
+        for society_number in range(1, 5):
+            for day in range(1, 31):
+                rows.append(
+                    {
+                        "facility": "FacilityAlpha",
+                        "dcs": 100.0 + society_number,
+                        "society_name": f"Synthetic Society {society_number}",
+                        "date": f"{day:02d}-{month:02d}-2026",
+                        "shift": "M" if day % 2 else "E",
+                        "vehicle": f"SyntheticVehicle{society_number}",
+                        "qty": 100.0 + (day % 5) - 2,
+                        "fat_pct": 5.0 + ((day % 5) - 2) * 0.05,
+                        "snf_pct": 8.6 + ((day % 5) - 2) * 0.04,
+                        "clr": 28.0 + ((day % 5) - 2) * 0.1,
+                        "file_month": month,
+                        "file_year": 2026,
+                        "season": pipeline.season_for_month(month),
+                    }
+                )
+    records = pd.DataFrame(rows)
+    records.loc[
+        (records["file_month"] == 4) & (records["dcs"] == 101.0) & (records["date"] == "01-04-2026"),
+        ["snf_pct", "clr"],
+    ] = [7.0, 23.0]
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: records)
+
+    result = pipeline.run_pipeline("synthetic-input", tmp_path / "screening.db")
+
+    assert len(result["runs"]) == 4
+    assert [run["mode"] for run in result["runs"][:3]] == ["seed_only"] * 3
+    assert result["runs"][3]["mode"] == "detection"
+    assert result["runs"][3]["report_bundle"]["history_inputs"]["historical_month_stats_count"] == 12
+    assert result["records_processed"] == 480
+    assert (tmp_path / "screening.db").exists()
+
+
 def test_r5_clr_spike_only_flags_high_clr_direction():
     df = _records(
         [

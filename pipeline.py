@@ -840,20 +840,95 @@ def analyze_month(month_df, historical_month_stats=None, source_name=""):
     }
 
 
+def _concat_run_frames(runs, key):
+    frames = [run[key] for run in runs if key in run and len(run[key])]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _sqlite_ready(frame):
+    """Encode structured values that SQLite drivers cannot bind directly."""
+    ready = frame.copy()
+    for column in ready.columns:
+        if ready[column].map(lambda value: isinstance(value, (dict, list))).any():
+            ready[column] = ready[column].map(
+                lambda value: json.dumps(_jsonable(value)) if isinstance(value, (dict, list)) else value
+            )
+    return ready
+
+
 def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
-    df = load_all(source_dir)
-    result = analyze_month(df, historical_month_stats=pd.DataFrame(), source_name=str(source_dir))
-    con = sqlite3.connect(db_path)
-    result["month_stats"].to_sql("society_month_stats", con, if_exists="replace", index=False)
-    result["baselines"].to_sql("society_baselines", con, if_exists="replace", index=False)
-    result["flagged"].to_sql("flagged_anomalies", con, if_exists="replace", index=False)
-    result["daily_summary"].to_sql("daily_summary", con, if_exists="replace", index=False)
-    result["severity"].to_sql("severity", con, if_exists="replace", index=False)
-    result["month_summaries"].to_sql("month_summaries", con, if_exists="replace", index=False)
-    result["audit_trail"].to_sql("audit_trail", con, if_exists="replace", index=False)
-    pd.DataFrame([{"facility": result["report_bundle"]["file_identity"]["facility"], "file_year": result["report_bundle"]["file_identity"]["file_year"], "file_month": result["report_bundle"]["file_identity"]["file_month"], "bundle_json": json.dumps(result["report_bundle"])}]).to_sql("report_bundles", con, if_exists="replace", index=False)
-    con.close()
-    return result
+    """Analyze each reporting month in order and persist derived results.
+
+    A target month can use only monthly statistics created by earlier periods.
+    Grouping all input files before analysis would leak period identity and leave
+    the local CLI permanently without an eligible historical baseline.
+    """
+    del output_dir  # Reserved for a future local report-output adapter.
+    records = load_all(source_dir)
+    records = records.sort_values(["file_year", "file_month", "facility", "date"]).reset_index(drop=True)
+    historical_month_stats = pd.DataFrame()
+    runs = []
+
+    for (year, month), month_df in records.groupby(["file_year", "file_month"], sort=True):
+        result = analyze_month(
+            month_df.reset_index(drop=True),
+            historical_month_stats=historical_month_stats,
+            source_name=str(source_dir),
+        )
+        runs.append(result)
+        historical_month_stats = pd.concat(
+            [historical_month_stats, result["month_stats"]],
+            ignore_index=True,
+        )
+
+    if not runs:
+        raise ValueError("No reporting periods were available for analysis")
+
+    aggregated = {
+        key: _concat_run_frames(runs, key)
+        for key in [
+            "month_stats",
+            "baselines",
+            "flagged",
+            "report",
+            "daily_summary",
+            "severity",
+            "month_summaries",
+            "audit_trail",
+        ]
+    }
+    bundle_rows = [
+        {
+            "facility": run["report_bundle"]["file_identity"]["facility"],
+            "file_year": run["report_bundle"]["file_identity"]["file_year"],
+            "file_month": run["report_bundle"]["file_identity"]["file_month"],
+            "bundle_json": json.dumps(run["report_bundle"]),
+        }
+        for run in runs
+    ]
+
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as connection:
+        table_map = {
+            "month_stats": "society_month_stats",
+            "baselines": "society_baselines",
+            "flagged": "flagged_anomalies",
+            "daily_summary": "daily_summary",
+            "severity": "severity",
+            "month_summaries": "month_summaries",
+            "audit_trail": "audit_trail",
+        }
+        for key, table_name in table_map.items():
+            if len(aggregated[key]):
+                _sqlite_ready(aggregated[key]).to_sql(table_name, connection, if_exists="replace", index=False)
+        pd.DataFrame(bundle_rows).to_sql("report_bundles", connection, if_exists="replace", index=False)
+
+    latest = {**runs[-1], **aggregated}
+    latest["runs"] = runs
+    latest["report_bundles"] = [run["report_bundle"] for run in runs]
+    latest["records_processed"] = int(len(records))
+    return latest
 
 
 def main(argv=None):
@@ -862,7 +937,21 @@ def main(argv=None):
     parser.add_argument("--db", default=str(DB), help="SQLite database path")
     args = parser.parse_args(argv)
     result = run_pipeline(Path(args.source_dir), Path(args.db))
-    print(json.dumps({"facility": result["report_bundle"]["file_identity"]["facility"], "file_month": result["report_bundle"]["file_identity"]["file_month"], "file_year": result["report_bundle"]["file_identity"]["file_year"], "mode": result["mode"], "records_processed": result["processing_metrics"]["records_processed"] if "processing_metrics" in result else len(result["month_df"])}, indent=2))
+    print(
+        json.dumps(
+            {
+                "periods_processed": len(result["runs"]),
+                "records_processed": result["records_processed"],
+                "latest_period": {
+                    "facility": result["report_bundle"]["file_identity"]["facility"],
+                    "file_month": result["report_bundle"]["file_identity"]["file_month"],
+                    "file_year": result["report_bundle"]["file_identity"]["file_year"],
+                    "mode": result["mode"],
+                },
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
