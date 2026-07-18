@@ -10,18 +10,45 @@ review queues, and auditable quality-control reports.
 
 ## Project status
 
-The repository is being rebuilt from a working prototype into a generic,
-privacy-safe open-source package. The first public release will use synthetic
-fixtures exclusively; no customer or production data is included.
+The project is an alpha-quality screening engine with a tested analysis core,
+PDF reporting, local SQLite output, and an optional Supabase persistence path.
+Repository tests and examples use synthetic identities; no customer or
+production data is included.
 
-## Planned capabilities
+## Quick start
 
-- Parse common Excel milk-collection report layouts into a canonical schema.
-- Establish facility- and producer-level seasonal baselines.
-- Generate explainable composition and volume screening signals.
-- Preserve methodology version, input provenance, and analysis audit trails.
-- Produce human-readable reports and machine-readable analysis bundles.
-- Support local execution with optional hosted persistence adapters.
+Requires Python 3.11 or newer.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[reporting,dev]"
+pytest
+```
+
+Run the local screening CLI against a directory of `.xls` collection reports:
+
+```bash
+milk-quality-screen --source-dir data/input --db data/screening.db
+```
+
+Render a previously generated canonical analysis bundle:
+
+```bash
+milk-quality-report analysis_bundle.json --output report.pdf
+```
+
+The accepted workbook layouts and analytical boundaries are documented in
+[Methodology](docs/methodology.md).
+
+## Capabilities
+
+- Parses two common Excel milk-collection report layouts into a canonical schema.
+- Establishes facility- and producer-level seasonal baselines.
+- Generates explainable composition and volume screening signals.
+- Preserves methodology version, input provenance, and analysis audit trails.
+- Produces PDF reports and machine-readable analysis bundles.
+- Supports local SQLite execution and optional Supabase persistence.
 
 ## Why this project exists
 
@@ -40,15 +67,21 @@ are triage evidence, not laboratory confirmation.
 See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 [CONTRIBUTING.md](CONTRIBUTING.md) for contribution requirements.
 
+## Documentation
+
+- [Architecture](docs/architecture.md) — components, data flow, boundaries, and deployment model
+- [Methodology](docs/methodology.md) — rules, baseline policy, intended use, and limitations
+- [Contributing](CONTRIBUTING.md) — contributor workflow and privacy requirements
+- [Security](SECURITY.md) — vulnerability reporting and deployment responsibilities
+
 ## Roadmap
 
-1. Extract and rebrand the reusable analysis engine.
-2. Add deterministic synthetic fixtures and regression tests.
-3. Package the CLI and report renderer.
-4. Publish architecture and scientific validation documentation.
-5. Add continuous integration, security checks, and a seeded demo.
+1. Add deterministic, file-based synthetic demo fixtures.
+2. Introduce schema contracts and structured parser diagnostics.
+3. Replace compatibility field names with a versioned public schema.
+4. Add prospective validation tooling and reference-test labels.
+5. Build a seeded dashboard and multi-tenant API behind the stable core.
 
 ## License
 
 Released under the [MIT License](LICENSE).
-
