@@ -10,6 +10,7 @@ import datetime as _dt
 import json
 import re
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import numpy as np
@@ -909,20 +910,21 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
 
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as connection:
-        table_map = {
-            "month_stats": "society_month_stats",
-            "baselines": "society_baselines",
-            "flagged": "flagged_anomalies",
-            "daily_summary": "daily_summary",
-            "severity": "severity",
-            "month_summaries": "month_summaries",
-            "audit_trail": "audit_trail",
-        }
-        for key, table_name in table_map.items():
-            if len(aggregated[key]):
-                _sqlite_ready(aggregated[key]).to_sql(table_name, connection, if_exists="replace", index=False)
-        pd.DataFrame(bundle_rows).to_sql("report_bundles", connection, if_exists="replace", index=False)
+    with closing(sqlite3.connect(db_path)) as connection:
+        with connection:
+            table_map = {
+                "month_stats": "society_month_stats",
+                "baselines": "society_baselines",
+                "flagged": "flagged_anomalies",
+                "daily_summary": "daily_summary",
+                "severity": "severity",
+                "month_summaries": "month_summaries",
+                "audit_trail": "audit_trail",
+            }
+            for key, table_name in table_map.items():
+                if len(aggregated[key]):
+                    _sqlite_ready(aggregated[key]).to_sql(table_name, connection, if_exists="replace", index=False)
+            pd.DataFrame(bundle_rows).to_sql("report_bundles", connection, if_exists="replace", index=False)
 
     latest = {**runs[-1], **aggregated}
     latest["runs"] = runs
