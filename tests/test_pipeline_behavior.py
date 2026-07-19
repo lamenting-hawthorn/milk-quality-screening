@@ -248,6 +248,103 @@ def test_run_pipeline_processes_months_in_order_and_uses_prior_history(monkeypat
     assert (tmp_path / "screening.db").exists()
 
 
+def test_run_pipeline_preserves_prior_history_and_skips_an_idempotent_period(monkeypatch, tmp_path):
+    database = tmp_path / "screening.db"
+    first_month = _records(
+        [
+            {
+                "date": f"{day:02d}-01-2026",
+                "file_month": 1,
+                "file_year": 2026,
+                "season": "winter",
+            }
+            for day in range(1, 31)
+        ]
+    )
+    second_month = _records(
+        [
+            {
+                "date": f"{day:02d}-02-2026",
+                "file_month": 2,
+                "file_year": 2026,
+                "season": "winter",
+            }
+            for day in range(1, 31)
+        ]
+    )
+
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: first_month)
+    pipeline.run_pipeline("first", database)
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: second_month)
+    result = pipeline.run_pipeline("second", database)
+
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        stored_months = connection.execute("SELECT COUNT(*) FROM report_bundles").fetchone()[0]
+    assert result["runs"][0]["report_bundle"]["history_inputs"]["historical_month_stats_count"] == 1
+    assert stored_months == 2
+
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: second_month)
+    with pytest.raises(ValueError, match="No new reporting periods"):
+        pipeline.run_pipeline("second-again", database)
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM report_bundles").fetchone()[0] == 2
+
+
+def test_inspect_collection_frame_returns_row_level_rejections():
+    frame = pd.DataFrame(
+        [
+            {
+                "S.NO.": 1,
+                "VCH.": "V1",
+                "DATE": "01-04-2026",
+                "SHIFT.": "Morning",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+            {
+                "S.NO.": 2,
+                "VCH.": "V1",
+                "DATE": "02-04-2026",
+                "SHIFT.": "Evening",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "not-a-number",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+        ]
+    )
+
+    accepted, rejected, diagnostics = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert len(accepted) == 1
+    assert len(rejected) == 1
+    assert "missing_or_invalid_qty" in rejected.iloc[0]["rejection_reason"]
+    assert diagnostics["contract_version"] == "collection-workbook-v1"
+    with pytest.raises(pipeline.InputValidationError, match="rejected data row"):
+        pipeline.normalize_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+
+def test_recurring_signal_indicators_are_neutral_and_do_not_attribute_cause():
+    report = _records(
+        [
+            {"date": "01-04-2026", "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+            {"date": "02-04-2026", "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "REVIEW"},
+        ]
+    )
+
+    indicators = pipeline.build_recurring_signal_indicators(report)
+
+    assert indicators[0]["indicator"] == "RECURRING_SCREENING_PATTERN"
+    assert indicators[0]["screening_signal_count"] == 2
+    assert "adulter" not in indicators[0]["interpretation"].lower()
+
+
 def test_r5_clr_spike_only_flags_high_clr_direction():
     df = _records(
         [

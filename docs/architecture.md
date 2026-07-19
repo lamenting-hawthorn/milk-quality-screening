@@ -48,7 +48,10 @@ formatting changes from silently changing analytical outcomes.
 
 ### Local persistence
 
-`run_pipeline` writes derived tables to SQLite. The database is an output and is
+`run_pipeline` writes derived tables to SQLite. The database preserves completed
+facility-periods and their historical monthly statistics, so an incremental run
+uses earlier persisted periods and leaves an already completed period unchanged.
+It remains a local single-user workflow; the database is an output and is
 excluded from version control. Raw workbooks are never part of the repository.
 
 ### Hosted persistence adapter
@@ -71,13 +74,16 @@ The demo does not bypass or mock analytical behavior.
 ## Canonical data flow
 
 1. `parse_filename` extracts facility and reporting period from a workbook name.
-2. `normalize_collection_frame` maps supported input columns to canonical fields.
+2. `inspect_collection_frame` validates a versioned supported layout, emits a
+   schema fingerprint and row-level diagnostics, then `normalize_collection_frame`
+   accepts only a fully valid workbook.
 3. `compute_society_month_stats` creates compact historical summaries.
 4. `build_baselines_from_month_stats` uses only periods before the target month.
 5. `apply_rules` produces neutral screening signals.
 6. Confidence and shared-event logic adjust review priority.
 7. `build_analysis_bundle` records methodology, provenance, results, and actions.
-8. Output adapters consume the bundle without changing the result.
+8. Local persistence creates durable review cases for reportable signals.
+9. Output adapters consume the bundle without changing the result.
 
 ## Key invariants
 
@@ -102,7 +108,8 @@ The demo does not bypass or mock analytical behavior.
 
 - Source modules remain flat while the public API stabilizes.
 - Input schema detection supports two known layouts and lacks a formal schema registry.
-- SQLite writes currently replace derived tables in a single local run.
+- The local workbook contract supports two layouts; additional vendor exports
+  still require a reviewed adapter.
 - Supabase requests are synchronous and use a privileged server-side credential.
 - There is no user authentication, tenant isolation, job queue, or hosted API yet.
 - The compatibility schema still contains legacy field names such as `diagnosis`
