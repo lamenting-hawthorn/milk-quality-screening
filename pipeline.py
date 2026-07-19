@@ -223,11 +223,13 @@ def inspect_collection_frame(df, facility, month, year, preview_rows=20):
         raise InputValidationError(f"Missing required columns after normalization: {sorted(missing)}")
 
     source_row = pd.Series(range(2, len(normalized) + 2), index=normalized.index, dtype="int64")
-    record_evidence_columns = ["date", "shift", "dcs", "fat_pct", "snf_pct", "clr"]
+    record_evidence_columns = [column for column in KEEP if column != "serial_no" and column in normalized.columns]
     has_record_evidence = normalized[record_evidence_columns].apply(
         lambda column: column.notna() & column.astype(str).str.strip().ne("")
     ).any(axis=1)
-    data_rows = normalized[normalized["serial_no"].notna() | has_record_evidence].copy()
+    society_label = normalized["society_name"].fillna("").astype(str).str.strip().str.upper()
+    is_summary_row = normalized["serial_no"].isna() & society_label.isin({"TOTAL", "GRAND TOTAL", "SUBTOTAL"})
+    data_rows = normalized[(normalized["serial_no"].notna() | has_record_evidence) & ~is_summary_row].copy()
     source_row = source_row.loc[data_rows.index]
     numeric_columns = ["qty", "fat_pct", "snf_pct", "clr", "kg_fat", "kg_snf", "rate", "amount", "dcs"]
     for column in numeric_columns:
@@ -237,12 +239,23 @@ def inspect_collection_frame(df, facility, month, year, preview_rows=20):
     reasons = pd.Series("", index=data_rows.index, dtype="object")
     missing_serial = data_rows["serial_no"].isna() | data_rows["serial_no"].astype(str).str.strip().eq("")
     reasons.loc[missing_serial] = "missing_serial_no"
+    date_text = data_rows["date"].astype(str).str.strip()
+    iso_dates = date_text.str.match(r"^\d{4}-\d{1,2}-\d{1,2}(?:\s|$)")
+    parsed_dates = pd.Series(pd.NaT, index=data_rows.index, dtype="datetime64[ns]")
+    parsed_dates.loc[iso_dates] = pd.to_datetime(data_rows.loc[iso_dates, "date"], errors="coerce")
+    parsed_dates.loc[~iso_dates] = pd.to_datetime(
+        data_rows.loc[~iso_dates, "date"], format="mixed", dayfirst=True, errors="coerce"
+    )
+    invalid_date = parsed_dates.isna()
+    reasons.loc[invalid_date] = reasons.loc[invalid_date].map(
+        lambda current: f"{current}; missing_or_invalid_date".strip("; ")
+    )
     for column in ["dcs", "fat_pct", "snf_pct", "clr", "qty"]:
         invalid = data_rows[column].isna()
         reasons.loc[invalid] = reasons.loc[invalid].map(
             lambda current, column=column: f"{current}; missing_or_invalid_{column}".strip("; ")
         )
-    for column in ["date", "shift", "society_name"]:
+    for column in ["shift", "society_name"]:
         invalid = data_rows[column].isna() | data_rows[column].astype(str).str.strip().eq("")
         reasons.loc[invalid] = reasons.loc[invalid].map(
             lambda current, column=column: f"{current}; missing_{column}".strip("; ")
@@ -252,6 +265,7 @@ def inspect_collection_frame(df, facility, month, year, preview_rows=20):
     rejected.insert(0, "source_row", source_row.loc[rejected.index])
     rejected["rejection_reason"] = reasons.loc[rejected.index]
     accepted = data_rows[reasons.eq("")].copy()
+    accepted["date"] = parsed_dates.loc[accepted.index].dt.strftime("%d-%m-%Y")
     accepted["society_name"] = accepted["society_name"].astype(str).str.strip()
     accepted["shift"] = accepted["shift"].astype(str).str.strip().str.upper().str[0]
     accepted["vehicle"] = accepted["vehicle"].astype(str).str.strip()
@@ -1127,6 +1141,14 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
         historical_month_stats = pd.concat(
             [historical_month_stats, result["month_stats"]],
             ignore_index=True,
+        )
+
+    for result in runs:
+        identity = result["report_bundle"]["file_identity"]
+        result["audit_trail"] = result["audit_trail"].assign(
+            facility=identity["facility"],
+            file_year=identity["file_year"],
+            file_month=identity["file_month"],
         )
 
     if not runs:

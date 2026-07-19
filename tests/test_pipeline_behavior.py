@@ -356,6 +356,47 @@ def test_inspect_collection_frame_rejects_populated_rows_without_serial_number()
     assert diagnostics["rejected_rows"] == 1
 
 
+def test_inspect_collection_frame_rejects_partial_rows_and_invalid_dates_but_ignores_total_footer():
+    frame = pd.DataFrame(
+        [
+            {
+                "S.NO.": 1,
+                "VCH.": "V1",
+                "DATE": "2026-04-01",
+                "SHIFT.": "Morning",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+            {"S.NO.": None, "SOCIETY NAME": "Partial", "QTY": "100"},
+            {
+                "S.NO.": 3,
+                "VCH.": "V1",
+                "DATE": "not-a-date",
+                "SHIFT.": "Morning",
+                "DCS": 103,
+                "SOCIETY NAME": "Gamma",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+            {"S.NO.": None, "SOCIETY NAME": "TOTAL", "QTY": "200"},
+        ]
+    )
+
+    accepted, rejected, diagnostics = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert accepted.iloc[0]["date"] == "01-04-2026"
+    assert len(rejected) == 2
+    assert "missing_serial_no" in rejected.iloc[0]["rejection_reason"]
+    assert "missing_or_invalid_date" in rejected.iloc[1]["rejection_reason"]
+    assert diagnostics["data_rows_seen"] == 3
+
+
 def test_recurring_signal_indicators_are_neutral_and_do_not_attribute_cause():
     report = _records(
         [
@@ -408,6 +449,28 @@ def test_run_pipeline_initializes_empty_review_cases_and_honors_legacy_all_perio
     monkeypatch.setattr(pipeline, "load_all", lambda source_dir: legacy_period)
     with pytest.raises(ValueError, match="No new reporting periods"):
         pipeline.run_pipeline("legacy", database)
+
+
+def test_run_pipeline_stamps_audit_rows_with_facility_and_reporting_period(monkeypatch, tmp_path):
+    database = tmp_path / "screening.db"
+    records = _records(
+        [
+            {
+                "date": f"{day:02d}-03-2026",
+                "file_month": 3,
+                "file_year": 2026,
+                "season": "winter",
+            }
+            for day in range(1, 31)
+        ]
+    )
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: records)
+
+    pipeline.run_pipeline("audit", database)
+
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        audit_rows = connection.execute("SELECT DISTINCT facility, file_year, file_month FROM audit_trail").fetchall()
+    assert audit_rows == [("FacilityAlpha", 2026, 3)]
 
 
 def test_r5_clr_spike_only_flags_high_clr_direction():
