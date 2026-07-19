@@ -7,6 +7,7 @@ human PDF report and Supabase persistence.
 """
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import re
 import sqlite3
@@ -107,8 +108,13 @@ SCREENING_DISCLAIMER = (
     "This system prioritizes records for review and confirmatory testing. "
     "It does not identify an adulterant, establish intent, or prove fraud."
 )
+
+
+class InputValidationError(ValueError):
+    """Raised when a workbook does not meet the public input contract."""
 FLAG_COLUMNS = [
     "facility",
+    "serial_no",
     "dcs",
     "society_name",
     "date",
@@ -150,6 +156,22 @@ FLAG_COLUMNS = [
     "confidence_base",
     "confidence_note",
 ]
+REVIEW_CASE_COLUMNS = [
+    "case_id",
+    "facility",
+    "dcs",
+    "society_name",
+    "file_year",
+    "file_month",
+    "screening_date",
+    "shift",
+    "screening_category",
+    "priority",
+    "status",
+    "recommended_next_step",
+    "disposition",
+    "confirmation_reference",
+]
 
 
 def season_for_month(month):
@@ -162,31 +184,147 @@ def parse_filename(fn):
     match = re.search(r"month of\s+([A-Za-z]+)\s+(\d{4})", base, re.I)
     if not match:
         return None
-    return facility, MONTH_MAP[match.group(1).lower()], int(match.group(2))
+    month = MONTH_MAP.get(match.group(1).lower())
+    return None if month is None else (facility, month, int(match.group(2)))
+
+
+def _schema_fingerprint(columns):
+    """Return a stable, non-sensitive identifier for a workbook header layout."""
+    normalized = [str(column).strip() for column in columns]
+    return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:16]
+
+
+def _select_column_mapping(columns):
+    available = {str(column).strip() for column in columns}
+    for name, mapping in (("layout_a", COLMAP_A), ("layout_b", COLMAP_B)):
+        required_source_columns = {source for source, target in mapping.items() if target in {"serial_no", "date", "shift", "dcs", "society_name", "qty", "fat_pct", "snf_pct", "clr"}}
+        if required_source_columns.issubset(available):
+            return name, mapping
+    return None, None
+
+
+def inspect_collection_frame(df, facility, month, year, preview_rows=20):
+    """Validate a supported workbook and return accepted rows plus diagnostics.
+
+    No data row is silently discarded: callers receive row-level rejection reasons
+    and can save the result before deciding whether to correct the source workbook.
+    """
+    layout, cmap = _select_column_mapping(df.columns)
+    fingerprint = _schema_fingerprint(df.columns)
+    if cmap is None:
+        raise InputValidationError(
+            f"Unsupported workbook schema (fingerprint {fingerprint}). "
+            "Use one of the documented layouts or add a versioned adapter."
+        )
+    normalized = df.copy()
+    normalized.columns = [str(column).strip() for column in normalized.columns]
+    normalized = normalized.rename(columns=cmap)
+    columns = [column for column in KEEP if column in normalized.columns]
+    normalized = normalized[columns].copy()
+    required = {"serial_no", "date", "shift", "dcs", "society_name", "qty", "fat_pct", "snf_pct", "clr"}
+    missing = required - set(normalized.columns)
+    if missing:
+        raise InputValidationError(f"Missing required columns after normalization: {sorted(missing)}")
+
+    source_row = pd.Series(range(2, len(normalized) + 2), index=normalized.index, dtype="int64")
+    record_evidence_columns = [column for column in KEEP if column != "serial_no" and column in normalized.columns]
+    has_record_evidence = normalized[record_evidence_columns].apply(
+        lambda column: column.notna() & column.astype(str).str.strip().ne("")
+    ).any(axis=1)
+    society_label = normalized["society_name"].fillna("").astype(str).str.strip().str.upper()
+    is_summary_row = normalized["serial_no"].isna() & society_label.isin({"TOTAL", "GRAND TOTAL", "SUBTOTAL"})
+    data_rows = normalized[(normalized["serial_no"].notna() | has_record_evidence) & ~is_summary_row].copy()
+    source_row = source_row.loc[data_rows.index]
+    numeric_columns = ["qty", "fat_pct", "snf_pct", "clr", "kg_fat", "kg_snf", "rate", "amount", "dcs"]
+    for column in numeric_columns:
+        if column in data_rows.columns:
+            data_rows[column] = pd.to_numeric(data_rows[column], errors="coerce")
+
+    reasons = pd.Series("", index=data_rows.index, dtype="object")
+    missing_serial = data_rows["serial_no"].isna() | data_rows["serial_no"].astype(str).str.strip().eq("")
+    reasons.loc[missing_serial] = "missing_serial_no"
+    date_text = data_rows["date"].astype(str).str.strip()
+    iso_dates = date_text.str.match(r"^\d{4}-\d{1,2}-\d{1,2}(?:\s|$)")
+    parsed_dates = pd.Series(pd.NaT, index=data_rows.index, dtype="datetime64[ns]")
+    parsed_dates.loc[iso_dates] = pd.to_datetime(data_rows.loc[iso_dates, "date"], errors="coerce")
+    parsed_dates.loc[~iso_dates] = pd.to_datetime(
+        data_rows.loc[~iso_dates, "date"], format="mixed", dayfirst=True, errors="coerce"
+    )
+    invalid_date = parsed_dates.isna()
+    reasons.loc[invalid_date] = reasons.loc[invalid_date].map(
+        lambda current: f"{current}; missing_or_invalid_date".strip("; ")
+    )
+    for column in ["dcs", "fat_pct", "snf_pct", "clr", "qty"]:
+        invalid = data_rows[column].isna() | ~np.isfinite(data_rows[column])
+        reasons.loc[invalid] = reasons.loc[invalid].map(
+            lambda current, column=column: f"{current}; missing_or_invalid_{column}".strip("; ")
+        )
+    shift_labels = data_rows["shift"].fillna("").astype(str).str.strip().str.upper()
+    canonical_shifts = shift_labels.map({"M": "M", "MORNING": "M", "E": "E", "EVENING": "E"})
+    invalid_shift = canonical_shifts.isna()
+    reasons.loc[invalid_shift] = reasons.loc[invalid_shift].map(
+        lambda current: f"{current}; missing_or_invalid_shift".strip("; ")
+    )
+    invalid_society = data_rows["society_name"].isna() | data_rows["society_name"].astype(str).str.strip().eq("")
+    reasons.loc[invalid_society] = reasons.loc[invalid_society].map(
+        lambda current: f"{current}; missing_society_name".strip("; ")
+    )
+
+    rejected = data_rows[reasons.ne("")].copy()
+    rejected.insert(0, "source_row", source_row.loc[rejected.index])
+    rejected["rejection_reason"] = reasons.loc[rejected.index]
+    accepted = data_rows[reasons.eq("")].copy()
+    accepted["date"] = parsed_dates.loc[accepted.index].dt.strftime("%d-%m-%Y")
+    accepted["society_name"] = accepted["society_name"].astype(str).str.strip()
+    accepted["shift"] = canonical_shifts.loc[accepted.index]
+    accepted["vehicle"] = accepted["vehicle"].astype(str).str.strip()
+    accepted["facility"] = facility
+    accepted["file_month"] = int(month)
+    accepted["file_year"] = int(year)
+    accepted["season"] = season_for_month(month)
+    diagnostics = {
+        "contract_version": "collection-workbook-v1",
+        "schema_layout": layout,
+        "schema_fingerprint": fingerprint,
+        "rows_seen": int(len(df)),
+        "data_rows_seen": int(len(data_rows)),
+        "accepted_rows": int(len(accepted)),
+        "rejected_rows": int(len(rejected)),
+        "rejection_counts": rejected["rejection_reason"].value_counts().to_dict() if len(rejected) else {},
+        "accepted_preview": accepted.head(preview_rows).to_dict("records"),
+        "rejected_preview": rejected.head(preview_rows).to_dict("records"),
+    }
+    return accepted, rejected, diagnostics
 
 
 def normalize_collection_frame(df, facility, month, year):
-    cmap = COLMAP_A if "S.NO." in df.columns else COLMAP_B
-    df = df.rename(columns=cmap)
-    columns = [column for column in KEEP if column in df.columns]
-    df = df[columns].copy()
-    required = {"serial_no", "date", "shift", "dcs", "society_name", "qty", "fat_pct", "snf_pct", "clr"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns after normalization: {sorted(missing)}")
-    df = df[df["serial_no"].notna()]
-    for column in ["qty", "fat_pct", "snf_pct", "clr", "kg_fat", "kg_snf", "rate", "amount", "dcs"]:
-        if column in df.columns:
-            df[column] = pd.to_numeric(df[column], errors="coerce")
-    df = df.dropna(subset=["dcs", "fat_pct", "snf_pct", "clr", "qty"])
-    df["society_name"] = df["society_name"].astype(str).str.strip()
-    df["shift"] = df["shift"].astype(str).str.strip().str.upper().str[0]
-    df["vehicle"] = df["vehicle"].astype(str).str.strip()
-    df["facility"] = facility
-    df["file_month"] = int(month)
-    df["file_year"] = int(year)
-    df["season"] = season_for_month(month)
-    return df
+    accepted, rejected, diagnostics = inspect_collection_frame(df, facility, month, year)
+    if len(rejected):
+        raise InputValidationError(
+            f"Workbook contains {len(rejected)} rejected data row(s); correct the source and run "
+            f"milk-quality-validate for details (schema {diagnostics['schema_fingerprint']})."
+        )
+    if not len(accepted):
+        raise InputValidationError("Workbook has no usable data rows after validation.")
+    return accepted
+
+
+def inspect_workbook(path, preview_rows=20):
+    """Read one workbook and return a JSON-safe validation report without persistence."""
+    parsed = parse_filename(path)
+    if parsed is None:
+        raise InputValidationError("Filename must include 'month of <Month> <Year>'.")
+    facility, month, year = parsed
+    engine = "openpyxl" if Path(path).suffix.lower() == ".xlsx" else "xlrd"
+    frame = pd.read_excel(path, engine=engine)
+    _, _, diagnostics = inspect_collection_frame(frame, facility, month, year, preview_rows=preview_rows)
+    return _jsonable({
+        "source_file": Path(path).name,
+        "facility": facility,
+        "file_year": year,
+        "file_month": month,
+        **diagnostics,
+    })
 
 
 def load_file(path):
@@ -328,9 +466,18 @@ def build_baselines_from_month_stats(month_stats_df, target_year, target_month):
     rows = []
     for (facility, dcs), all_group in prior.groupby(["facility", "dcs"]):
         total_prior_months = len(all_group)
-        rows.append(_baseline_from_month_groups(facility, dcs, "all", all_group, total_prior_months, len(all_group[all_group["season"] == season_for_month(target_month)])))
+        all_year = _baseline_from_month_groups(
+            facility, dcs, "all", all_group, total_prior_months,
+            len(all_group[all_group["season"] == season_for_month(target_month)]),
+        )
+        all_year.update({"file_year": int(target_year), "file_month": int(target_month)})
+        rows.append(all_year)
         for season, season_group in all_group.groupby("season"):
-            rows.append(_baseline_from_month_groups(facility, dcs, season, season_group, total_prior_months, len(season_group)))
+            baseline = _baseline_from_month_groups(
+                facility, dcs, season, season_group, total_prior_months, len(season_group)
+            )
+            baseline.update({"file_year": int(target_year), "file_month": int(target_month)})
+            rows.append(baseline)
     return pd.DataFrame(rows)
 
 
@@ -405,6 +552,7 @@ def apply_rules(df, baselines):
         if any([r1, r2, r3, r4, r5, r6, r7]):
             flagged_rows.append({
                 "facility": record.facility,
+                "serial_no": getattr(record, "serial_no", None),
                 "dcs": record.dcs,
                 "society_name": record.society_name,
                 "date": record.date,
@@ -541,11 +689,14 @@ def build_daily_summary(flagged, all_records):
 
 def build_severity(report):
     if not len(report):
-        return pd.DataFrame(columns=["facility", "dcs", "society_name", "flags", "severity", "primary_diagnosis"])
+        return pd.DataFrame(
+            columns=["facility", "dcs", "society_name", "file_year", "file_month", "flags", "severity", "primary_diagnosis"]
+        )
     ym = report["file_year"] * 100 + report["file_month"]
     cutoff = sorted(ym.unique())[-6] if len(ym.unique()) >= 6 else ym.min()
     recent = report[ym >= cutoff]
-    severity = recent.groupby(["facility", "dcs", "society_name"]).size().rename("flags").reset_index()
+    group_keys = ["facility", "dcs", "society_name", "file_year", "file_month"]
+    severity = recent.groupby(group_keys).size().rename("flags").reset_index()
     def level(count):
         if count >= 30:
             return "VERY_FREQUENT"
@@ -555,8 +706,13 @@ def build_severity(report):
             return "RECURRING"
         return "ISOLATED"
     severity["severity"] = severity["flags"].apply(level)
-    primary = recent.groupby(["facility", "dcs", "society_name"])["diagnosis"].agg(lambda s: s.mode().iloc[0] if len(s.mode()) else s.iloc[0]).rename("primary_diagnosis").reset_index()
-    return severity.merge(primary, on=["facility", "dcs", "society_name"], how="left")
+    primary = (
+        recent.groupby(group_keys)["diagnosis"]
+        .agg(lambda s: s.mode().iloc[0] if len(s.mode()) else s.iloc[0])
+        .rename("primary_diagnosis")
+        .reset_index()
+    )
+    return severity.merge(primary, on=group_keys, how="left")
 
 
 def build_month_summaries(df, flagged, report, mode="detection"):
@@ -680,6 +836,7 @@ def build_analysis_bundle(
     sections = {}
     diagnosis_counts = report["diagnosis"].value_counts().to_dict() if len(report) else {}
     severity_rows = severity.to_dict("records") if len(severity) else []
+    recurring_patterns = build_recurring_signal_indicators(report)
     watchlist = build_calibration_watchlist(month_stats)
     baseline_snapshot = baselines[["facility", "dcs", "society_name", "season", "record_count", "prior_month_count", "same_season_prior_month_count", "eligible"]].to_dict("records") if len(baselines) else []
     sections["executive_summary"] = {
@@ -713,6 +870,14 @@ def build_analysis_bundle(
         "title": "Screening Category Distribution",
         "counts": diagnosis_counts,
         "confidence_counts": report["confidence"].value_counts().to_dict() if len(report) else {},
+    }
+    sections["recurring_signal_indicators"] = {
+        "title": "Recurring Screening Signal Indicators",
+        "interpretation": (
+            "Repeated screening signals can prioritize investigation, but do not identify an adulterant, "
+            "establish intent, or prove fraud."
+        ),
+        "rows": recurring_patterns,
     }
     sections["screening_distribution"] = sections["diagnosis_distribution"]
     sections["top_offenders"] = {
@@ -793,6 +958,7 @@ def build_analysis_bundle(
         "report_records": report.to_dict("records") if len(report) else [],
         "daily_summary": daily.to_dict("records") if len(daily) else [],
         "severity": severity_rows,
+        "recurring_signal_indicators": recurring_patterns,
         "sections": sections,
         "retrieval": {
             "summary_text": sections["executive_summary"]["summary"],
@@ -805,6 +971,36 @@ def build_analysis_bundle(
         },
     }
     return _jsonable(bundle)
+
+
+def build_recurring_signal_indicators(report, minimum_signals=2):
+    """Summarize repeated signals within a processed period without cause attribution."""
+    if report.empty:
+        return []
+    grouped = (
+        report.groupby(["facility", "dcs", "society_name", "diagnosis"], dropna=False)
+        .agg(
+            screening_signal_count=("date", "size"),
+            first_signal_date=("date", "min"),
+            last_signal_date=("date", "max"),
+            highest_priority=(
+                "confidence",
+                lambda values: next(
+                    (priority for priority in ("RESAMPLE", "REVIEW", "MONITOR") if priority in set(values)),
+                    "MONITOR",
+                ),
+            ),
+        )
+        .reset_index()
+    )
+    repeated = grouped[grouped["screening_signal_count"] >= minimum_signals].copy()
+    if repeated.empty:
+        return []
+    repeated["indicator"] = "RECURRING_SCREENING_PATTERN"
+    repeated["interpretation"] = (
+        "Repeat source-integrity checks and controlled resampling; confirmation is required before any causal conclusion."
+    )
+    return repeated.sort_values(["screening_signal_count", "facility", "dcs"], ascending=[False, True, True]).to_dict("records")
 
 
 def analyze_month(month_df, historical_month_stats=None, source_name=""):
@@ -859,6 +1055,75 @@ def _sqlite_ready(frame):
     return ready
 
 
+def _read_sqlite_table(connection, table_name):
+    try:
+        return pd.read_sql_query(f"SELECT * FROM {table_name}", connection)
+    except (pd.errors.DatabaseError, sqlite3.OperationalError):
+        return pd.DataFrame()
+
+
+def _merge_derived_rows(existing, new, keys, preserve_existing=False):
+    """Merge derived state deterministically instead of discarding prior periods."""
+    if existing.empty:
+        return new.copy()
+    if new.empty:
+        return existing.copy()
+    combined = pd.concat([new, existing] if preserve_existing else [existing, new], ignore_index=True)
+    available_keys = [key for key in keys if key in combined.columns]
+    return combined.drop_duplicates(subset=available_keys, keep="last").reset_index(drop=True)
+
+
+def _review_case_rows(report):
+    """Create neutral, stable review cases; screening results never imply cause."""
+    rows = []
+    for _, row in report.iterrows():
+        identity = "|".join(
+            str(row.get(key, ""))
+            for key in ("facility", "serial_no", "dcs", "date", "shift", "file_year", "file_month", "diagnosis")
+        )
+        rows.append(
+            {
+                "case_id": hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20],
+                "facility": row["facility"],
+                "dcs": row["dcs"],
+                "society_name": row["society_name"],
+                "file_year": row["file_year"],
+                "file_month": row["file_month"],
+                "screening_date": row["date"],
+                "shift": row["shift"],
+                "screening_category": row["diagnosis"],
+                "priority": row["confidence"],
+                "status": "OPEN",
+                "recommended_next_step": "Review source integrity and collect a controlled resample before confirmation.",
+                "disposition": None,
+                "confirmation_reference": None,
+            }
+        )
+    return pd.DataFrame(rows, columns=REVIEW_CASE_COLUMNS).drop_duplicates(subset=["case_id"]).reset_index(drop=True)
+
+
+def _completed_period_keys(report_bundles):
+    if report_bundles.empty:
+        return set()
+    required = {"facility", "file_year", "file_month"}
+    if not required.issubset(report_bundles.columns):
+        return set()
+    return {
+        (str(row.facility), int(row.file_year), int(row.file_month))
+        for row in report_bundles[list(required)].dropna().itertuples(index=False)
+    }
+
+
+def _legacy_all_periods(report_bundles):
+    if report_bundles.empty:
+        return set()
+    required = {"facility", "file_year", "file_month"}
+    if not required.issubset(report_bundles.columns):
+        return set()
+    legacy = report_bundles[report_bundles["facility"].eq("ALL")]
+    return {(int(row.file_year), int(row.file_month)) for row in legacy.dropna().itertuples(index=False)}
+
+
 def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
     """Analyze each reporting month in order and persist derived results.
 
@@ -869,10 +1134,31 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
     del output_dir  # Reserved for a future local report-output adapter.
     records = load_all(source_dir)
     records = records.sort_values(["file_year", "file_month", "facility", "date"]).reset_index(drop=True)
-    historical_month_stats = pd.DataFrame()
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        existing = {
+            "month_stats": _read_sqlite_table(connection, "society_month_stats"),
+            "baselines": _read_sqlite_table(connection, "society_baselines"),
+            "flagged": _read_sqlite_table(connection, "flagged_anomalies"),
+            "daily_summary": _read_sqlite_table(connection, "daily_summary"),
+            "severity": _read_sqlite_table(connection, "severity"),
+            "month_summaries": _read_sqlite_table(connection, "month_summaries"),
+            "audit_trail": _read_sqlite_table(connection, "audit_trail"),
+            "report_bundles": _read_sqlite_table(connection, "report_bundles"),
+            "review_cases": _read_sqlite_table(connection, "review_cases"),
+        }
+    historical_month_stats = existing["month_stats"].copy()
+    completed_periods = _completed_period_keys(existing["report_bundles"])
+    legacy_all_periods = _legacy_all_periods(existing["report_bundles"])
     runs = []
+    skipped_periods = []
 
-    for (year, month), month_df in records.groupby(["file_year", "file_month"], sort=True):
+    for (year, month, facility), month_df in records.groupby(["file_year", "file_month", "facility"], sort=True):
+        period_key = (str(facility), int(year), int(month))
+        if period_key in completed_periods or (int(year), int(month)) in legacy_all_periods:
+            skipped_periods.append(period_key)
+            continue
         result = analyze_month(
             month_df.reset_index(drop=True),
             historical_month_stats=historical_month_stats,
@@ -884,8 +1170,16 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
             ignore_index=True,
         )
 
+    for result in runs:
+        identity = result["report_bundle"]["file_identity"]
+        result["audit_trail"] = result["audit_trail"].assign(
+            facility=identity["facility"],
+            file_year=identity["file_year"],
+            file_month=identity["file_month"],
+        )
+
     if not runs:
-        raise ValueError("No reporting periods were available for analysis")
+        raise ValueError("No new reporting periods were available; existing periods were left unchanged.")
 
     aggregated = {
         key: _concat_run_frames(runs, key)
@@ -910,8 +1204,28 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
         for run in runs
     ]
 
-    db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    table_keys = {
+        "month_stats": ["facility", "dcs", "file_year", "file_month"],
+        "baselines": ["facility", "dcs", "season", "file_year", "file_month"],
+        "flagged": ["facility", "serial_no", "dcs", "date", "shift", "file_year", "file_month", "diagnosis"],
+        "daily_summary": ["facility", "date", "shift"],
+        "severity": ["facility", "dcs", "file_year", "file_month"],
+        "month_summaries": ["facility", "file_year", "file_month"],
+    }
+    persisted = {
+        key: _merge_derived_rows(existing[key], aggregated[key], table_keys[key])
+        for key in table_keys
+    }
+    persisted["audit_trail"] = pd.concat([existing["audit_trail"], aggregated["audit_trail"]], ignore_index=True)
+    persisted["report_bundles"] = _merge_derived_rows(
+        existing["report_bundles"],
+        pd.DataFrame(bundle_rows),
+        ["facility", "file_year", "file_month"],
+    )
+    new_cases = _review_case_rows(aggregated["report"])
+    persisted["review_cases"] = _merge_derived_rows(
+        existing["review_cases"], new_cases, ["case_id"], preserve_existing=True
+    )
     with closing(sqlite3.connect(db_path)) as connection:
         with connection:
             table_map = {
@@ -924,14 +1238,16 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
                 "audit_trail": "audit_trail",
             }
             for key, table_name in table_map.items():
-                if len(aggregated[key]):
-                    _sqlite_ready(aggregated[key]).to_sql(table_name, connection, if_exists="replace", index=False)
-            pd.DataFrame(bundle_rows).to_sql("report_bundles", connection, if_exists="replace", index=False)
+                if len(persisted[key]):
+                    _sqlite_ready(persisted[key]).to_sql(table_name, connection, if_exists="replace", index=False)
+            _sqlite_ready(persisted["report_bundles"]).to_sql("report_bundles", connection, if_exists="replace", index=False)
+            _sqlite_ready(persisted["review_cases"]).to_sql("review_cases", connection, if_exists="replace", index=False)
 
     latest = {**runs[-1], **aggregated}
     latest["runs"] = runs
     latest["report_bundles"] = [run["report_bundle"] for run in runs]
     latest["records_processed"] = int(len(records))
+    latest["skipped_periods"] = ["%s:%04d-%02d" % key for key in skipped_periods]
     return latest
 
 
@@ -956,6 +1272,21 @@ def main(argv=None):
             indent=2,
         )
     )
+
+
+def validation_main(argv=None):
+    parser = argparse.ArgumentParser(description="Validate a milk collection workbook before screening.")
+    parser.add_argument("workbook", help="Path to one .xls or .xlsx workbook")
+    parser.add_argument("--output", help="Optional path for the JSON validation report")
+    parser.add_argument("--preview-rows", type=int, default=20, help="Accepted and rejected rows to preview")
+    args = parser.parse_args(argv)
+    report = inspect_workbook(Path(args.workbook), preview_rows=args.preview_rows)
+    serialized = json.dumps(report, indent=2)
+    if args.output:
+        Path(args.output).write_text(serialized + "\n", encoding="utf-8")
+    print(serialized)
+    if report["rejected_rows"]:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

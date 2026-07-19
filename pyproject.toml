@@ -46,10 +46,12 @@ dev = [
 
 [project.scripts]
 milk-quality-screen = "pipeline:main"
+milk-quality-validate = "pipeline:validation_main"
 milk-quality-report = "build_report:main"
 milk-quality-supabase = "supabase_pipeline:main"
 milk-quality-synthetic-data = "synthetic_data:main"
 milk-quality-demo = "demo:main"
+milk-quality-cases = "case_workflow:main"
 
 [project.urls]
 Documentation = "https://github.com/lamenting-hawthorn/milk-quality-screening#readme"
@@ -57,7 +59,7 @@ Issues = "https://github.com/lamenting-hawthorn/milk-quality-screening/issues"
 Source = "https://github.com/lamenting-hawthorn/milk-quality-screening"
 
 [tool.setuptools]
-py-modules = ["pipeline", "build_report", "supabase_pipeline", "synthetic_data", "demo"]
+py-modules = ["pipeline", "build_report", "supabase_pipeline", "synthetic_data", "demo", "case_workflow"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"

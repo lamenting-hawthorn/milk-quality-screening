@@ -5,8 +5,9 @@ turns routine milk composition reports into reproducible statistical signals,
 review queues, and auditable quality-control reports.
 
 > [!IMPORTANT]
-> This project prioritizes records for human review and confirmatory testing.
-> It does not identify adulterants, establish intent, or prove fraud.
+> This project identifies **statistical screening patterns** that can prioritize
+> human review and confirmatory testing. It does not identify specific
+> adulterants, establish intent, or prove fraud from routine collection data.
 
 ## Project status
 
@@ -59,6 +60,28 @@ Run the local screening CLI against a directory of `.xls` or `.xlsx` collection 
 milk-quality-screen --source-dir data/input --db data/screening.db
 ```
 
+Validate one workbook before processing it. The command emits a versioned
+schema fingerprint, accepted/rejected counts, and row-level rejection reasons;
+screening stops rather than silently dropping invalid data rows.
+
+```bash
+milk-quality-validate "data/input/Facility milk collection for the month of April 2026.xlsx" \
+  --output validation-report.json
+```
+
+Each reportable signal opens a durable local review case. Track the human
+workflow and link the controlled resample or laboratory disposition:
+
+```bash
+milk-quality-cases --db data/screening.db list --status OPEN
+milk-quality-cases --db data/screening.db update CASE_ID \
+  --status LAB_PENDING --confirmation-reference "COC-2026-0042"
+```
+
+Re-running an already completed period leaves it unchanged. New periods use
+persisted prior monthly statistics for their baseline; SQLite remains a local
+single-user workflow, not a multi-center hosted deployment.
+
 Render a previously generated canonical analysis bundle:
 
 ```bash
@@ -76,6 +99,12 @@ The accepted workbook layouts and analytical boundaries are documented in
 - Preserves methodology version, input provenance, and analysis audit trails.
 - Produces PDF reports and machine-readable analysis bundles.
 - Supports local SQLite execution and optional Supabase persistence.
+- Rejects unsupported or malformed workbooks with a schema fingerprint and
+  row-level diagnostics instead of silent record loss.
+- Preserves local historical baselines across incremental runs and creates
+  idempotent reporting-period records.
+- Surfaces recurring screening patterns and durable review cases for resample
+  and confirmatory-test follow-up.
 
 ## Why this project exists
 
@@ -99,15 +128,17 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 - [Architecture](docs/architecture.md) — components, data flow, boundaries, and deployment model
 - [Demo walkthrough](docs/demo.md) — deterministic synthetic scenario and generated artifacts
 - [Methodology](docs/methodology.md) — rules, baseline policy, intended use, and limitations
+- [Field-pilot guide](docs/field-pilot.md) — prospective validation and evidence requirements
+- [Hosted deployment boundary](docs/hosted-deployment.md) — multi-tenant security prerequisites
 - [Contributing](CONTRIBUTING.md) — contributor workflow and privacy requirements
 - [Security](SECURITY.md) — vulnerability reporting and deployment responsibilities
 
 ## Roadmap
 
-1. Introduce schema contracts and structured parser diagnostics.
-2. Replace compatibility field names with a versioned public schema.
-3. Add prospective validation tooling and reference-test labels.
-4. Build a seeded dashboard and multi-tenant API behind the stable core.
+1. Add versioned public schemas and configurable input adapters.
+2. Add prospective validation tooling and reference-test labels.
+3. Build a seeded dashboard and multi-tenant API behind the stable core.
+4. Publish a field-pilot guide, demo video, and tagged release after external validation.
 
 ## License
 

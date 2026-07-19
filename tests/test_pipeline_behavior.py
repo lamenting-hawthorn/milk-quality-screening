@@ -7,6 +7,7 @@ import pipeline
 def _records(rows):
     defaults = {
         "facility": "FacilityAlpha",
+        "serial_no": 1,
         "dcs": 101.0,
         "society_name": "Test Society",
         "date": "01-04-2025",
@@ -146,6 +147,34 @@ def test_load_file_accepts_both_excel_column_variants(monkeypatch, filename, fra
     assert "Data" not in loaded.columns
 
 
+def test_inspect_collection_frame_normalizes_surrounding_header_whitespace():
+    frame = pd.DataFrame(
+        [
+            {
+                " S.NO. ": 1,
+                " VCH. ": "V1",
+                " DATE ": "01-04-2026",
+                " SHIFT. ": "Morning",
+                " DCS ": 101,
+                " SOCIETY NAME ": "Alpha",
+                " QTY ": "100",
+                " Fat % ": "5.0",
+                " Snf % ": "8.6",
+                " CLR ": "28",
+            }
+        ]
+    )
+
+    accepted, rejected, _ = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert len(accepted) == 1
+    assert rejected.empty
+
+
+def test_parse_filename_rejects_unknown_month_tokens():
+    assert pipeline.parse_filename("Facility month of Foo 2026.xlsx") is None
+
+
 def test_apply_rules_uses_matching_season_baseline_before_all_year_fallback():
     df = _records(
         [
@@ -246,6 +275,333 @@ def test_run_pipeline_processes_months_in_order_and_uses_prior_history(monkeypat
     assert result["runs"][3]["report_bundle"]["history_inputs"]["historical_month_stats_count"] == 12
     assert result["records_processed"] == 480
     assert (tmp_path / "screening.db").exists()
+
+
+def test_run_pipeline_preserves_prior_history_and_skips_an_idempotent_period(monkeypatch, tmp_path):
+    database = tmp_path / "screening.db"
+    first_month = _records(
+        [
+            {
+                "date": f"{day:02d}-01-2026",
+                "file_month": 1,
+                "file_year": 2026,
+                "season": "winter",
+            }
+            for day in range(1, 31)
+        ]
+    )
+    second_month = _records(
+        [
+            {
+                "date": f"{day:02d}-02-2026",
+                "file_month": 2,
+                "file_year": 2026,
+                "season": "winter",
+            }
+            for day in range(1, 31)
+        ]
+    )
+
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: first_month)
+    pipeline.run_pipeline("first", database)
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: second_month)
+    result = pipeline.run_pipeline("second", database)
+
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        stored_months = connection.execute("SELECT COUNT(*) FROM report_bundles").fetchone()[0]
+    assert result["runs"][0]["report_bundle"]["history_inputs"]["historical_month_stats_count"] == 1
+    assert stored_months == 2
+
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: second_month)
+    with pytest.raises(ValueError, match="No new reporting periods"):
+        pipeline.run_pipeline("second-again", database)
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM report_bundles").fetchone()[0] == 2
+
+
+def test_inspect_collection_frame_returns_row_level_rejections():
+    frame = pd.DataFrame(
+        [
+            {
+                "S.NO.": 1,
+                "VCH.": "V1",
+                "DATE": "01-04-2026",
+                "SHIFT.": "Morning",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+            {
+                "S.NO.": 2,
+                "VCH.": "V1",
+                "DATE": "02-04-2026",
+                "SHIFT.": "Evening",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "not-a-number",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+        ]
+    )
+
+    accepted, rejected, diagnostics = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert len(accepted) == 1
+    assert len(rejected) == 1
+    assert "missing_or_invalid_qty" in rejected.iloc[0]["rejection_reason"]
+    assert diagnostics["contract_version"] == "collection-workbook-v1"
+    with pytest.raises(pipeline.InputValidationError, match="rejected data row"):
+        pipeline.normalize_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+
+def test_inspect_collection_frame_rejects_populated_rows_without_serial_number():
+    frame = pd.DataFrame(
+        [
+            {
+                "S.NO.": None,
+                "VCH.": "V1",
+                "DATE": "01-04-2026",
+                "SHIFT.": "Morning",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            }
+        ]
+    )
+
+    accepted, rejected, diagnostics = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert accepted.empty
+    assert len(rejected) == 1
+    assert rejected.iloc[0]["rejection_reason"] == "missing_serial_no"
+    assert diagnostics["rejected_rows"] == 1
+
+
+def test_inspect_collection_frame_rejects_partial_rows_and_invalid_dates_but_ignores_total_footer():
+    frame = pd.DataFrame(
+        [
+            {
+                "S.NO.": 1,
+                "VCH.": "V1",
+                "DATE": "2026-04-01",
+                "SHIFT.": "Morning",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+            {"S.NO.": None, "SOCIETY NAME": "Partial", "QTY": "100"},
+            {
+                "S.NO.": 3,
+                "VCH.": "V1",
+                "DATE": "not-a-date",
+                "SHIFT.": "Morning",
+                "DCS": 103,
+                "SOCIETY NAME": "Gamma",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+            {"S.NO.": None, "SOCIETY NAME": "TOTAL", "QTY": "200"},
+        ]
+    )
+
+    accepted, rejected, diagnostics = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert accepted.iloc[0]["date"] == "01-04-2026"
+    assert len(rejected) == 2
+    assert "missing_serial_no" in rejected.iloc[0]["rejection_reason"]
+    assert "missing_or_invalid_date" in rejected.iloc[1]["rejection_reason"]
+    assert diagnostics["data_rows_seen"] == 3
+
+
+def test_recurring_signal_indicators_are_neutral_and_do_not_attribute_cause():
+    report = _records(
+        [
+            {"date": "01-04-2026", "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+            {"date": "02-04-2026", "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "REVIEW"},
+        ]
+    )
+
+    indicators = pipeline.build_recurring_signal_indicators(report)
+
+    assert indicators[0]["indicator"] == "RECURRING_SCREENING_PATTERN"
+    assert indicators[0]["screening_signal_count"] == 2
+    assert "adulter" not in indicators[0]["interpretation"].lower()
+
+
+def test_recurring_signal_indicators_preserve_monitor_priority():
+    report = _records(
+        [
+            {"date": "01-04-2026", "diagnosis": "UNCLASSIFIED_SCREENING_SIGNAL", "confidence": "MONITOR"},
+            {"date": "02-04-2026", "diagnosis": "UNCLASSIFIED_SCREENING_SIGNAL", "confidence": "MONITOR"},
+        ]
+    )
+
+    assert pipeline.build_recurring_signal_indicators(report)[0]["highest_priority"] == "MONITOR"
+
+
+def test_run_pipeline_initializes_empty_review_cases_and_honors_legacy_all_period(monkeypatch, tmp_path):
+    database = tmp_path / "screening.db"
+    seed_only = _records(
+        [
+            {
+                "date": f"{day:02d}-01-2026",
+                "file_month": 1,
+                "file_year": 2026,
+                "season": "winter",
+            }
+            for day in range(1, 31)
+        ]
+    )
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: seed_only)
+    pipeline.run_pipeline("seed", database)
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM review_cases").fetchone()[0] == 0
+
+    legacy_period = seed_only.assign(facility="FacilityBeta")
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        connection.execute("INSERT INTO report_bundles VALUES (?, ?, ?, ?)", ("ALL", 2026, 2, "{}"))
+        connection.commit()
+    legacy_period["file_month"] = 2
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: legacy_period)
+    with pytest.raises(ValueError, match="No new reporting periods"):
+        pipeline.run_pipeline("legacy", database)
+
+
+def test_run_pipeline_stamps_audit_rows_with_facility_and_reporting_period(monkeypatch, tmp_path):
+    database = tmp_path / "screening.db"
+    records = _records(
+        [
+            {
+                "date": f"{day:02d}-03-2026",
+                "file_month": 3,
+                "file_year": 2026,
+                "season": "winter",
+            }
+            for day in range(1, 31)
+        ]
+    )
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: records)
+
+    pipeline.run_pipeline("audit", database)
+
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        audit_rows = connection.execute("SELECT DISTINCT facility, file_year, file_month FROM audit_trail").fetchall()
+    assert audit_rows == [("FacilityAlpha", 2026, 3)]
+
+
+def test_validation_rejects_non_finite_measurements_and_unsupported_shifts():
+    frame = pd.DataFrame(
+        [
+            {
+                "S.NO.": 1,
+                "VCH.": "V1",
+                "DATE": "01-04-2026",
+                "SHIFT.": "Night",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+            {
+                "S.NO.": 2,
+                "VCH.": "V1",
+                "DATE": "02-04-2026",
+                "SHIFT.": "Morning",
+                "DCS": 102,
+                "SOCIETY NAME": "Beta",
+                "QTY": "100",
+                "Fat %": "inf",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+        ]
+    )
+
+    _, rejected, _ = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert "missing_or_invalid_shift" in rejected.iloc[0]["rejection_reason"]
+    assert "missing_or_invalid_fat_pct" in rejected.iloc[1]["rejection_reason"]
+
+
+def test_record_identity_preserves_distinct_cases_and_flagged_rows():
+    report = _records(
+        [
+            {"serial_no": 1, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+            {"serial_no": 2, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+        ]
+    )
+
+    cases = pipeline._review_case_rows(report)
+    merged_flags = pipeline._merge_derived_rows(
+        report.iloc[:1], report.iloc[1:], ["facility", "serial_no", "dcs", "date", "shift", "file_year", "file_month", "diagnosis"]
+    )
+
+    assert cases["case_id"].nunique() == 2
+    assert len(merged_flags) == 2
+
+
+def test_review_cases_deduplicate_same_source_record():
+    duplicate_report = _records(
+        [
+            {"serial_no": 1, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+            {"serial_no": 1, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+        ]
+    )
+
+    assert len(pipeline._review_case_rows(duplicate_report)) == 1
+
+
+def test_severity_preserves_reporting_period_identity():
+    report = _records(
+        [
+            {"file_year": 2026, "file_month": 3, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN"},
+            {"file_year": 2026, "file_month": 4, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN"},
+        ]
+    )
+
+    severity = pipeline.build_severity(report)
+
+    assert set(severity["file_month"]) == {3, 4}
+
+
+def test_baseline_merge_preserves_target_reporting_periods():
+    stats = []
+    for month in range(1, 5):
+        frame = _records(
+            [
+                {
+                    "file_year": 2026,
+                    "file_month": month,
+                    "season": pipeline.season_for_month(month),
+                    "date": f"01-{month:02d}-2026",
+                }
+            ]
+        )
+        stats.append(pipeline.compute_society_month_stats(frame))
+    history = pd.concat(stats, ignore_index=True)
+
+    april = pipeline.build_baselines_from_month_stats(history, 2026, 4)
+    may = pipeline.build_baselines_from_month_stats(history, 2026, 5)
+    merged = pipeline._merge_derived_rows(
+        april, may, ["facility", "dcs", "season", "file_year", "file_month"]
+    )
+
+    assert set(merged["file_month"]) == {4, 5}
 
 
 def test_r5_clr_spike_only_flags_high_clr_direction():

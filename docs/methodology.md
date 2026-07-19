@@ -56,6 +56,15 @@ baseline plus absolute guardrails.
 These thresholds are screening heuristics, not universal acceptance limits.
 They require prospective validation before operational reliance.
 
+## Recurring screening patterns
+
+When the same society and screening category recur at least twice in a
+processed reporting period, the engine emits a `RECURRING_SCREENING_PATTERN`
+indicator. It is a starting point for operational follow-up: review source
+integrity, verify the collection process, and collect a controlled resample.
+It does not identify a substance, establish intent, or confirm an adverse
+finding.
+
 ## Disabled repeated-spike rule
 
 R8 is intentionally disabled. A fixed count of measurements above a percentile
@@ -131,4 +140,3 @@ The analysis bundle records a methodology version. Any change to thresholds,
 baseline eligibility, seasonal routing, category mapping, or priority adjustment
 must update tests and documentation and should advance that version. Historical
 runs should remain reproducible under the version that produced them.
-
