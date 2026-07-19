@@ -24,6 +24,11 @@ INJECTED_EVENT = {
 }
 
 
+def _bounded_noise(rng, scale):
+    """Return realistic variation without accidental threshold-crossing tails."""
+    return float(np.clip(rng.normal(), -1.4, 1.4)) * scale
+
+
 def _month_frame(month, rng):
     rows = []
     serial_number = 1
@@ -33,10 +38,10 @@ def _month_frame(month, rng):
         for shift in ("Morning", "Evening"):
             for society_index, (dcs, society_name) in enumerate(SOCIETIES, start=1):
                 seasonal_offset = 0.03 * (month - 1)
-                fat = 5.0 + society_index * 0.08 - seasonal_offset + rng.normal(0, 0.08)
-                snf = 8.6 + society_index * 0.025 - seasonal_offset / 2 + rng.normal(0, 0.06)
-                clr = 28.0 + society_index * 0.08 - seasonal_offset + rng.normal(0, 0.22)
-                qty = 95.0 + society_index * 4 + rng.normal(0, 4.0)
+                fat = 5.0 + society_index * 0.08 - seasonal_offset + _bounded_noise(rng, 0.08)
+                snf = 8.6 + society_index * 0.025 - seasonal_offset / 2 + _bounded_noise(rng, 0.06)
+                clr = 28.0 + society_index * 0.08 - seasonal_offset + _bounded_noise(rng, 0.22)
+                qty = 95.0 + society_index * 4 + _bounded_noise(rng, 4.0)
 
                 if (
                     month == INJECTED_EVENT["month"]
@@ -114,4 +119,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
