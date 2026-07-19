@@ -194,18 +194,20 @@ def load_file(path):
     if parsed is None:
         return None
     facility, month, year = parsed
-    frame = pd.read_excel(path, engine="xlrd")
+    engine = "openpyxl" if Path(path).suffix.lower() == ".xlsx" else "xlrd"
+    frame = pd.read_excel(path, engine=engine)
     return normalize_collection_frame(frame, facility, month, year)
 
 
 def load_all(source_dir=SRC):
     frames = []
-    for path in sorted(Path(source_dir).rglob("*.xls")):
+    paths = [*Path(source_dir).rglob("*.xls"), *Path(source_dir).rglob("*.xlsx")]
+    for path in sorted(paths):
         frame = load_file(path)
         if frame is not None and len(frame):
             frames.append(frame)
     if not frames:
-        raise FileNotFoundError(f"No readable .xls files found in {source_dir}")
+        raise FileNotFoundError(f"No readable .xls or .xlsx files found in {source_dir}")
     return pd.concat(frames, ignore_index=True)
 
 

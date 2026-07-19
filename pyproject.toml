@@ -28,6 +28,7 @@ classifiers = [
 ]
 dependencies = [
   "numpy>=1.26",
+  "openpyxl>=3.1",
   "pandas>=2.2",
   "xlrd>=2.0.1",
 ]
@@ -47,6 +48,7 @@ dev = [
 milk-quality-screen = "pipeline:main"
 milk-quality-report = "build_report:main"
 milk-quality-supabase = "supabase_pipeline:main"
+milk-quality-synthetic-data = "synthetic_data:main"
 
 [project.urls]
 Documentation = "https://github.com/lamenting-hawthorn/milk-quality-screening#readme"
@@ -54,7 +56,7 @@ Issues = "https://github.com/lamenting-hawthorn/milk-quality-screening/issues"
 Source = "https://github.com/lamenting-hawthorn/milk-quality-screening"
 
 [tool.setuptools]
-py-modules = ["pipeline", "build_report", "supabase_pipeline"]
+py-modules = ["pipeline", "build_report", "supabase_pipeline", "synthetic_data"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
