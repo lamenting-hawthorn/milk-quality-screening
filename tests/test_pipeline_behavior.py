@@ -147,6 +147,34 @@ def test_load_file_accepts_both_excel_column_variants(monkeypatch, filename, fra
     assert "Data" not in loaded.columns
 
 
+def test_inspect_collection_frame_normalizes_surrounding_header_whitespace():
+    frame = pd.DataFrame(
+        [
+            {
+                " S.NO. ": 1,
+                " VCH. ": "V1",
+                " DATE ": "01-04-2026",
+                " SHIFT. ": "Morning",
+                " DCS ": 101,
+                " SOCIETY NAME ": "Alpha",
+                " QTY ": "100",
+                " Fat % ": "5.0",
+                " Snf % ": "8.6",
+                " CLR ": "28",
+            }
+        ]
+    )
+
+    accepted, rejected, _ = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert len(accepted) == 1
+    assert rejected.empty
+
+
+def test_parse_filename_rejects_unknown_month_tokens():
+    assert pipeline.parse_filename("Facility month of Foo 2026.xlsx") is None
+
+
 def test_apply_rules_uses_matching_season_baseline_before_all_year_fallback():
     df = _records(
         [
@@ -527,6 +555,17 @@ def test_record_identity_preserves_distinct_cases_and_flagged_rows():
     assert len(merged_flags) == 2
 
 
+def test_review_cases_deduplicate_same_source_record():
+    duplicate_report = _records(
+        [
+            {"serial_no": 1, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+            {"serial_no": 1, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+        ]
+    )
+
+    assert len(pipeline._review_case_rows(duplicate_report)) == 1
+
+
 def test_severity_preserves_reporting_period_identity():
     report = _records(
         [
@@ -538,6 +577,31 @@ def test_severity_preserves_reporting_period_identity():
     severity = pipeline.build_severity(report)
 
     assert set(severity["file_month"]) == {3, 4}
+
+
+def test_baseline_merge_preserves_target_reporting_periods():
+    stats = []
+    for month in range(1, 5):
+        frame = _records(
+            [
+                {
+                    "file_year": 2026,
+                    "file_month": month,
+                    "season": pipeline.season_for_month(month),
+                    "date": f"01-{month:02d}-2026",
+                }
+            ]
+        )
+        stats.append(pipeline.compute_society_month_stats(frame))
+    history = pd.concat(stats, ignore_index=True)
+
+    april = pipeline.build_baselines_from_month_stats(history, 2026, 4)
+    may = pipeline.build_baselines_from_month_stats(history, 2026, 5)
+    merged = pipeline._merge_derived_rows(
+        april, may, ["facility", "dcs", "season", "file_year", "file_month"]
+    )
+
+    assert set(merged["file_month"]) == {4, 5}
 
 
 def test_r5_clr_spike_only_flags_high_clr_direction():

@@ -184,7 +184,8 @@ def parse_filename(fn):
     match = re.search(r"month of\s+([A-Za-z]+)\s+(\d{4})", base, re.I)
     if not match:
         return None
-    return facility, MONTH_MAP[match.group(1).lower()], int(match.group(2))
+    month = MONTH_MAP.get(match.group(1).lower())
+    return None if month is None else (facility, month, int(match.group(2)))
 
 
 def _schema_fingerprint(columns):
@@ -215,7 +216,9 @@ def inspect_collection_frame(df, facility, month, year, preview_rows=20):
             f"Unsupported workbook schema (fingerprint {fingerprint}). "
             "Use one of the documented layouts or add a versioned adapter."
         )
-    normalized = df.rename(columns=cmap)
+    normalized = df.copy()
+    normalized.columns = [str(column).strip() for column in normalized.columns]
+    normalized = normalized.rename(columns=cmap)
     columns = [column for column in KEEP if column in normalized.columns]
     normalized = normalized[columns].copy()
     required = {"serial_no", "date", "shift", "dcs", "society_name", "qty", "fat_pct", "snf_pct", "clr"}
@@ -463,9 +466,18 @@ def build_baselines_from_month_stats(month_stats_df, target_year, target_month):
     rows = []
     for (facility, dcs), all_group in prior.groupby(["facility", "dcs"]):
         total_prior_months = len(all_group)
-        rows.append(_baseline_from_month_groups(facility, dcs, "all", all_group, total_prior_months, len(all_group[all_group["season"] == season_for_month(target_month)])))
+        all_year = _baseline_from_month_groups(
+            facility, dcs, "all", all_group, total_prior_months,
+            len(all_group[all_group["season"] == season_for_month(target_month)]),
+        )
+        all_year.update({"file_year": int(target_year), "file_month": int(target_month)})
+        rows.append(all_year)
         for season, season_group in all_group.groupby("season"):
-            rows.append(_baseline_from_month_groups(facility, dcs, season, season_group, total_prior_months, len(season_group)))
+            baseline = _baseline_from_month_groups(
+                facility, dcs, season, season_group, total_prior_months, len(season_group)
+            )
+            baseline.update({"file_year": int(target_year), "file_month": int(target_month)})
+            rows.append(baseline)
     return pd.DataFrame(rows)
 
 
@@ -1087,7 +1099,7 @@ def _review_case_rows(report):
                 "confirmation_reference": None,
             }
         )
-    return pd.DataFrame(rows, columns=REVIEW_CASE_COLUMNS)
+    return pd.DataFrame(rows, columns=REVIEW_CASE_COLUMNS).drop_duplicates(subset=["case_id"]).reset_index(drop=True)
 
 
 def _completed_period_keys(report_bundles):
@@ -1194,7 +1206,7 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
 
     table_keys = {
         "month_stats": ["facility", "dcs", "file_year", "file_month"],
-        "baselines": ["facility", "dcs", "season"],
+        "baselines": ["facility", "dcs", "season", "file_year", "file_month"],
         "flagged": ["facility", "serial_no", "dcs", "date", "shift", "file_year", "file_month", "diagnosis"],
         "daily_summary": ["facility", "date", "shift"],
         "severity": ["facility", "dcs", "file_year", "file_month"],
