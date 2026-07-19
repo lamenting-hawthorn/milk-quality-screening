@@ -122,9 +122,9 @@ def render_report_bundle(bundle, output_path=None):
         from reportlab.lib.units import cm
         from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     except ModuleNotFoundError:
-        output_path = Path(output_path or ROOT / f"milk_quality_screening_{bundle['file_identity']['facility']}_{bundle['file_identity']['file_year']}_{bundle['file_identity']['file_month']:02d}.pdf")
-        output_path.write_bytes(json.dumps(bundle, indent=2).encode("utf-8"))
-        return output_path
+        raise RuntimeError(
+            "PDF rendering requires the reporting dependencies. Install with: pip install -e '.[reporting]'"
+        ) from None
 
     styles = _styles()
     file_identity = bundle["file_identity"]

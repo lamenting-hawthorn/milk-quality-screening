@@ -36,3 +36,4 @@ def test_render_report_bundle_uses_bundle_only(tmp_path):
 
     assert output.exists()
     assert output.stat().st_size > 0
+    assert output.read_bytes().startswith(b"%PDF-")
