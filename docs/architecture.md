@@ -25,6 +25,7 @@ flowchart LR
     G --> I["PDF report"]
     G --> J["SQLite output"]
     G --> K["Optional Supabase adapter"]
+    L["Deterministic synthetic generator"] --> A
 ```
 
 ## Components
@@ -59,6 +60,13 @@ server-side.
 
 The hosted adapter is optional. The analysis engine and report renderer do not
 require Supabase.
+
+### Synthetic demonstration
+
+`synthetic_data.py` generates four chronological `.xlsx` workbooks from a fixed
+seed. `demo.py` passes those files through the public parser and local pipeline,
+then writes the SQLite database, latest analysis bundle, summary, and PDF report.
+The demo does not bypass or mock analytical behavior.
 
 ## Canonical data flow
 
@@ -109,4 +117,3 @@ then add an authenticated API, queue-backed workers, private object storage,
 PostgreSQL row-level isolation, idempotency keys, and immutable run provenance.
 Those additions should preserve the canonical bundle contract and keep the
 screening engine independent from infrastructure providers.
-

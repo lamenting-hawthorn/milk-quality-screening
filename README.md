@@ -22,11 +22,38 @@ Requires Python 3.11 or newer.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[reporting,dev]"
-pytest
+pip install -e ".[reporting]"
+milk-quality-demo
 ```
 
-Run the local screening CLI against a directory of `.xls` collection reports:
+The command creates deterministic synthetic Excel workbooks, analyzes four
+months in chronological order, detects one controlled screening event, and
+writes all outputs to `demo-output/`.
+
+```json
+{
+  "synthetic": true,
+  "periods_processed": 4,
+  "records_processed": 1200,
+  "latest_mode": "detection",
+  "latest_screening_records": 1
+}
+```
+
+Read the [demo walkthrough](docs/demo.md) for the generated scenario, output
+files, reproducibility contract, and safety boundaries.
+
+For contributor tooling and the full test suite:
+
+```bash
+pip install -e ".[reporting,dev]"
+pytest
+ruff check .
+```
+
+## Using your own reports
+
+Run the local screening CLI against a directory of `.xls` or `.xlsx` collection reports:
 
 ```bash
 milk-quality-screen --source-dir data/input --db data/screening.db
@@ -70,17 +97,17 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 ## Documentation
 
 - [Architecture](docs/architecture.md) — components, data flow, boundaries, and deployment model
+- [Demo walkthrough](docs/demo.md) — deterministic synthetic scenario and generated artifacts
 - [Methodology](docs/methodology.md) — rules, baseline policy, intended use, and limitations
 - [Contributing](CONTRIBUTING.md) — contributor workflow and privacy requirements
 - [Security](SECURITY.md) — vulnerability reporting and deployment responsibilities
 
 ## Roadmap
 
-1. Add deterministic, file-based synthetic demo fixtures.
-2. Introduce schema contracts and structured parser diagnostics.
-3. Replace compatibility field names with a versioned public schema.
-4. Add prospective validation tooling and reference-test labels.
-5. Build a seeded dashboard and multi-tenant API behind the stable core.
+1. Introduce schema contracts and structured parser diagnostics.
+2. Replace compatibility field names with a versioned public schema.
+3. Add prospective validation tooling and reference-test labels.
+4. Build a seeded dashboard and multi-tenant API behind the stable core.
 
 ## License
 
