@@ -19,7 +19,11 @@ def _seed_case(database):
         )
         connection.execute(
             "INSERT INTO review_cases VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("case-1", "FacilityAlpha", 101, "Alpha", 2026, 4, "01-04-2026", "M", "LOW_DENSITY_COMPOSITION_SCREEN", "RESAMPLE", "OPEN", "Resample", None, None),
+            ("case-1", "FacilityAlpha", 101, "Alpha", 2026, 4, "01-04-2026", "M", "LOW_DENSITY_COMPOSITION_SCREEN", "MONITOR", "OPEN", "Resample", None, None),
+        )
+        connection.execute(
+            "INSERT INTO review_cases VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("case-2", "FacilityAlpha", 102, "Beta", 2026, 4, "01-04-2026", "M", "LOW_DENSITY_COMPOSITION_SCREEN", "RESAMPLE", "OPEN", "Resample", None, None),
         )
 
 
@@ -27,7 +31,7 @@ def test_case_workflow_lists_and_updates_human_disposition(tmp_path):
     database = tmp_path / "screening.db"
     _seed_case(database)
 
-    assert [case["case_id"] for case in case_workflow.list_cases(database, "OPEN")] == ["case-1"]
+    assert [case["case_id"] for case in case_workflow.list_cases(database, "OPEN")] == ["case-2", "case-1"]
     result = case_workflow.update_case(
         database, "case-1", "lab_pending", "Controlled resample sent", "COC-2026-0042"
     )

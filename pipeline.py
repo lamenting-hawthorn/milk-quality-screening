@@ -155,6 +155,22 @@ FLAG_COLUMNS = [
     "confidence_base",
     "confidence_note",
 ]
+REVIEW_CASE_COLUMNS = [
+    "case_id",
+    "facility",
+    "dcs",
+    "society_name",
+    "file_year",
+    "file_month",
+    "screening_date",
+    "shift",
+    "screening_category",
+    "priority",
+    "status",
+    "recommended_next_step",
+    "disposition",
+    "confirmation_reference",
+]
 
 
 def season_for_month(month):
@@ -207,7 +223,11 @@ def inspect_collection_frame(df, facility, month, year, preview_rows=20):
         raise InputValidationError(f"Missing required columns after normalization: {sorted(missing)}")
 
     source_row = pd.Series(range(2, len(normalized) + 2), index=normalized.index, dtype="int64")
-    data_rows = normalized[normalized["serial_no"].notna()].copy()
+    record_evidence_columns = ["date", "shift", "dcs", "fat_pct", "snf_pct", "clr"]
+    has_record_evidence = normalized[record_evidence_columns].apply(
+        lambda column: column.notna() & column.astype(str).str.strip().ne("")
+    ).any(axis=1)
+    data_rows = normalized[normalized["serial_no"].notna() | has_record_evidence].copy()
     source_row = source_row.loc[data_rows.index]
     numeric_columns = ["qty", "fat_pct", "snf_pct", "clr", "kg_fat", "kg_snf", "rate", "amount", "dcs"]
     for column in numeric_columns:
@@ -215,6 +235,8 @@ def inspect_collection_frame(df, facility, month, year, preview_rows=20):
             data_rows[column] = pd.to_numeric(data_rows[column], errors="coerce")
 
     reasons = pd.Series("", index=data_rows.index, dtype="object")
+    missing_serial = data_rows["serial_no"].isna() | data_rows["serial_no"].astype(str).str.strip().eq("")
+    reasons.loc[missing_serial] = "missing_serial_no"
     for column in ["dcs", "fat_pct", "snf_pct", "clr", "qty"]:
         invalid = data_rows[column].isna()
         reasons.loc[invalid] = reasons.loc[invalid].map(
@@ -920,7 +942,13 @@ def build_recurring_signal_indicators(report, minimum_signals=2):
             screening_signal_count=("date", "size"),
             first_signal_date=("date", "min"),
             last_signal_date=("date", "max"),
-            highest_priority=("confidence", lambda values: "RESAMPLE" if "RESAMPLE" in set(values) else "REVIEW"),
+            highest_priority=(
+                "confidence",
+                lambda values: next(
+                    (priority for priority in ("RESAMPLE", "REVIEW", "MONITOR") if priority in set(values)),
+                    "MONITOR",
+                ),
+            ),
         )
         .reset_index()
     )
@@ -1030,7 +1058,7 @@ def _review_case_rows(report):
                 "confirmation_reference": None,
             }
         )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=REVIEW_CASE_COLUMNS)
 
 
 def _completed_period_keys(report_bundles):
@@ -1043,6 +1071,16 @@ def _completed_period_keys(report_bundles):
         (str(row.facility), int(row.file_year), int(row.file_month))
         for row in report_bundles[list(required)].dropna().itertuples(index=False)
     }
+
+
+def _legacy_all_periods(report_bundles):
+    if report_bundles.empty:
+        return set()
+    required = {"facility", "file_year", "file_month"}
+    if not required.issubset(report_bundles.columns):
+        return set()
+    legacy = report_bundles[report_bundles["facility"].eq("ALL")]
+    return {(int(row.file_year), int(row.file_month)) for row in legacy.dropna().itertuples(index=False)}
 
 
 def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
@@ -1071,12 +1109,13 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
         }
     historical_month_stats = existing["month_stats"].copy()
     completed_periods = _completed_period_keys(existing["report_bundles"])
+    legacy_all_periods = _legacy_all_periods(existing["report_bundles"])
     runs = []
     skipped_periods = []
 
     for (year, month, facility), month_df in records.groupby(["file_year", "file_month", "facility"], sort=True):
         period_key = (str(facility), int(year), int(month))
-        if period_key in completed_periods:
+        if period_key in completed_periods or (int(year), int(month)) in legacy_all_periods:
             skipped_periods.append(period_key)
             continue
         result = analyze_month(
@@ -1153,8 +1192,7 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
                 if len(persisted[key]):
                     _sqlite_ready(persisted[key]).to_sql(table_name, connection, if_exists="replace", index=False)
             _sqlite_ready(persisted["report_bundles"]).to_sql("report_bundles", connection, if_exists="replace", index=False)
-            if len(persisted["review_cases"]):
-                _sqlite_ready(persisted["review_cases"]).to_sql("review_cases", connection, if_exists="replace", index=False)
+            _sqlite_ready(persisted["review_cases"]).to_sql("review_cases", connection, if_exists="replace", index=False)
 
     latest = {**runs[-1], **aggregated}
     latest["runs"] = runs

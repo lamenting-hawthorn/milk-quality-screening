@@ -330,6 +330,32 @@ def test_inspect_collection_frame_returns_row_level_rejections():
         pipeline.normalize_collection_frame(frame, "FacilityAlpha", 4, 2026)
 
 
+def test_inspect_collection_frame_rejects_populated_rows_without_serial_number():
+    frame = pd.DataFrame(
+        [
+            {
+                "S.NO.": None,
+                "VCH.": "V1",
+                "DATE": "01-04-2026",
+                "SHIFT.": "Morning",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            }
+        ]
+    )
+
+    accepted, rejected, diagnostics = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert accepted.empty
+    assert len(rejected) == 1
+    assert rejected.iloc[0]["rejection_reason"] == "missing_serial_no"
+    assert diagnostics["rejected_rows"] == 1
+
+
 def test_recurring_signal_indicators_are_neutral_and_do_not_attribute_cause():
     report = _records(
         [
@@ -343,6 +369,45 @@ def test_recurring_signal_indicators_are_neutral_and_do_not_attribute_cause():
     assert indicators[0]["indicator"] == "RECURRING_SCREENING_PATTERN"
     assert indicators[0]["screening_signal_count"] == 2
     assert "adulter" not in indicators[0]["interpretation"].lower()
+
+
+def test_recurring_signal_indicators_preserve_monitor_priority():
+    report = _records(
+        [
+            {"date": "01-04-2026", "diagnosis": "UNCLASSIFIED_SCREENING_SIGNAL", "confidence": "MONITOR"},
+            {"date": "02-04-2026", "diagnosis": "UNCLASSIFIED_SCREENING_SIGNAL", "confidence": "MONITOR"},
+        ]
+    )
+
+    assert pipeline.build_recurring_signal_indicators(report)[0]["highest_priority"] == "MONITOR"
+
+
+def test_run_pipeline_initializes_empty_review_cases_and_honors_legacy_all_period(monkeypatch, tmp_path):
+    database = tmp_path / "screening.db"
+    seed_only = _records(
+        [
+            {
+                "date": f"{day:02d}-01-2026",
+                "file_month": 1,
+                "file_year": 2026,
+                "season": "winter",
+            }
+            for day in range(1, 31)
+        ]
+    )
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: seed_only)
+    pipeline.run_pipeline("seed", database)
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM review_cases").fetchone()[0] == 0
+
+    legacy_period = seed_only.assign(facility="FacilityBeta")
+    with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
+        connection.execute("INSERT INTO report_bundles VALUES (?, ?, ?, ?)", ("ALL", 2026, 2, "{}"))
+        connection.commit()
+    legacy_period["file_month"] = 2
+    monkeypatch.setattr(pipeline, "load_all", lambda source_dir: legacy_period)
+    with pytest.raises(ValueError, match="No new reporting periods"):
+        pipeline.run_pipeline("legacy", database)
 
 
 def test_r5_clr_spike_only_flags_high_clr_direction():

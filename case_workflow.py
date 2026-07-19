@@ -27,7 +27,16 @@ def list_cases(db_path, status=None):
         if status:
             query += " WHERE status = ?"
             parameters.append(status)
-        query += " ORDER BY file_year DESC, file_month DESC, priority, case_id"
+        query += """
+            ORDER BY file_year DESC, file_month DESC,
+                CASE priority
+                    WHEN 'RESAMPLE' THEN 1
+                    WHEN 'REVIEW' THEN 2
+                    WHEN 'MONITOR' THEN 3
+                    ELSE 4
+                END,
+                case_id
+        """
         return [dict(row) for row in connection.execute(query, parameters).fetchall()]
 
 
