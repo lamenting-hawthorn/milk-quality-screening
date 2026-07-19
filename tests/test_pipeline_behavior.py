@@ -7,6 +7,7 @@ import pipeline
 def _records(rows):
     defaults = {
         "facility": "FacilityAlpha",
+        "serial_no": 1,
         "dcs": 101.0,
         "society_name": "Test Society",
         "date": "01-04-2025",
@@ -471,6 +472,72 @@ def test_run_pipeline_stamps_audit_rows_with_facility_and_reporting_period(monke
     with pipeline.closing(pipeline.sqlite3.connect(database)) as connection:
         audit_rows = connection.execute("SELECT DISTINCT facility, file_year, file_month FROM audit_trail").fetchall()
     assert audit_rows == [("FacilityAlpha", 2026, 3)]
+
+
+def test_validation_rejects_non_finite_measurements_and_unsupported_shifts():
+    frame = pd.DataFrame(
+        [
+            {
+                "S.NO.": 1,
+                "VCH.": "V1",
+                "DATE": "01-04-2026",
+                "SHIFT.": "Night",
+                "DCS": 101,
+                "SOCIETY NAME": "Alpha",
+                "QTY": "100",
+                "Fat %": "5.0",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+            {
+                "S.NO.": 2,
+                "VCH.": "V1",
+                "DATE": "02-04-2026",
+                "SHIFT.": "Morning",
+                "DCS": 102,
+                "SOCIETY NAME": "Beta",
+                "QTY": "100",
+                "Fat %": "inf",
+                "Snf %": "8.6",
+                "CLR": "28",
+            },
+        ]
+    )
+
+    _, rejected, _ = pipeline.inspect_collection_frame(frame, "FacilityAlpha", 4, 2026)
+
+    assert "missing_or_invalid_shift" in rejected.iloc[0]["rejection_reason"]
+    assert "missing_or_invalid_fat_pct" in rejected.iloc[1]["rejection_reason"]
+
+
+def test_record_identity_preserves_distinct_cases_and_flagged_rows():
+    report = _records(
+        [
+            {"serial_no": 1, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+            {"serial_no": 2, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN", "confidence": "RESAMPLE"},
+        ]
+    )
+
+    cases = pipeline._review_case_rows(report)
+    merged_flags = pipeline._merge_derived_rows(
+        report.iloc[:1], report.iloc[1:], ["facility", "serial_no", "dcs", "date", "shift", "file_year", "file_month", "diagnosis"]
+    )
+
+    assert cases["case_id"].nunique() == 2
+    assert len(merged_flags) == 2
+
+
+def test_severity_preserves_reporting_period_identity():
+    report = _records(
+        [
+            {"file_year": 2026, "file_month": 3, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN"},
+            {"file_year": 2026, "file_month": 4, "diagnosis": "LOW_DENSITY_COMPOSITION_SCREEN"},
+        ]
+    )
+
+    severity = pipeline.build_severity(report)
+
+    assert set(severity["file_month"]) == {3, 4}
 
 
 def test_r5_clr_spike_only_flags_high_clr_direction():

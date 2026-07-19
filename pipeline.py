@@ -114,6 +114,7 @@ class InputValidationError(ValueError):
     """Raised when a workbook does not meet the public input contract."""
 FLAG_COLUMNS = [
     "facility",
+    "serial_no",
     "dcs",
     "society_name",
     "date",
@@ -251,15 +252,20 @@ def inspect_collection_frame(df, facility, month, year, preview_rows=20):
         lambda current: f"{current}; missing_or_invalid_date".strip("; ")
     )
     for column in ["dcs", "fat_pct", "snf_pct", "clr", "qty"]:
-        invalid = data_rows[column].isna()
+        invalid = data_rows[column].isna() | ~np.isfinite(data_rows[column])
         reasons.loc[invalid] = reasons.loc[invalid].map(
             lambda current, column=column: f"{current}; missing_or_invalid_{column}".strip("; ")
         )
-    for column in ["shift", "society_name"]:
-        invalid = data_rows[column].isna() | data_rows[column].astype(str).str.strip().eq("")
-        reasons.loc[invalid] = reasons.loc[invalid].map(
-            lambda current, column=column: f"{current}; missing_{column}".strip("; ")
-        )
+    shift_labels = data_rows["shift"].fillna("").astype(str).str.strip().str.upper()
+    canonical_shifts = shift_labels.map({"M": "M", "MORNING": "M", "E": "E", "EVENING": "E"})
+    invalid_shift = canonical_shifts.isna()
+    reasons.loc[invalid_shift] = reasons.loc[invalid_shift].map(
+        lambda current: f"{current}; missing_or_invalid_shift".strip("; ")
+    )
+    invalid_society = data_rows["society_name"].isna() | data_rows["society_name"].astype(str).str.strip().eq("")
+    reasons.loc[invalid_society] = reasons.loc[invalid_society].map(
+        lambda current: f"{current}; missing_society_name".strip("; ")
+    )
 
     rejected = data_rows[reasons.ne("")].copy()
     rejected.insert(0, "source_row", source_row.loc[rejected.index])
@@ -267,7 +273,7 @@ def inspect_collection_frame(df, facility, month, year, preview_rows=20):
     accepted = data_rows[reasons.eq("")].copy()
     accepted["date"] = parsed_dates.loc[accepted.index].dt.strftime("%d-%m-%Y")
     accepted["society_name"] = accepted["society_name"].astype(str).str.strip()
-    accepted["shift"] = accepted["shift"].astype(str).str.strip().str.upper().str[0]
+    accepted["shift"] = canonical_shifts.loc[accepted.index]
     accepted["vehicle"] = accepted["vehicle"].astype(str).str.strip()
     accepted["facility"] = facility
     accepted["file_month"] = int(month)
@@ -534,6 +540,7 @@ def apply_rules(df, baselines):
         if any([r1, r2, r3, r4, r5, r6, r7]):
             flagged_rows.append({
                 "facility": record.facility,
+                "serial_no": getattr(record, "serial_no", None),
                 "dcs": record.dcs,
                 "society_name": record.society_name,
                 "date": record.date,
@@ -670,11 +677,14 @@ def build_daily_summary(flagged, all_records):
 
 def build_severity(report):
     if not len(report):
-        return pd.DataFrame(columns=["facility", "dcs", "society_name", "flags", "severity", "primary_diagnosis"])
+        return pd.DataFrame(
+            columns=["facility", "dcs", "society_name", "file_year", "file_month", "flags", "severity", "primary_diagnosis"]
+        )
     ym = report["file_year"] * 100 + report["file_month"]
     cutoff = sorted(ym.unique())[-6] if len(ym.unique()) >= 6 else ym.min()
     recent = report[ym >= cutoff]
-    severity = recent.groupby(["facility", "dcs", "society_name"]).size().rename("flags").reset_index()
+    group_keys = ["facility", "dcs", "society_name", "file_year", "file_month"]
+    severity = recent.groupby(group_keys).size().rename("flags").reset_index()
     def level(count):
         if count >= 30:
             return "VERY_FREQUENT"
@@ -684,8 +694,13 @@ def build_severity(report):
             return "RECURRING"
         return "ISOLATED"
     severity["severity"] = severity["flags"].apply(level)
-    primary = recent.groupby(["facility", "dcs", "society_name"])["diagnosis"].agg(lambda s: s.mode().iloc[0] if len(s.mode()) else s.iloc[0]).rename("primary_diagnosis").reset_index()
-    return severity.merge(primary, on=["facility", "dcs", "society_name"], how="left")
+    primary = (
+        recent.groupby(group_keys)["diagnosis"]
+        .agg(lambda s: s.mode().iloc[0] if len(s.mode()) else s.iloc[0])
+        .rename("primary_diagnosis")
+        .reset_index()
+    )
+    return severity.merge(primary, on=group_keys, how="left")
 
 
 def build_month_summaries(df, flagged, report, mode="detection"):
@@ -1052,7 +1067,7 @@ def _review_case_rows(report):
     for _, row in report.iterrows():
         identity = "|".join(
             str(row.get(key, ""))
-            for key in ("facility", "dcs", "date", "shift", "file_year", "file_month", "diagnosis")
+            for key in ("facility", "serial_no", "dcs", "date", "shift", "file_year", "file_month", "diagnosis")
         )
         rows.append(
             {
@@ -1180,7 +1195,7 @@ def run_pipeline(source_dir=SRC, db_path=DB, output_dir=ROOT):
     table_keys = {
         "month_stats": ["facility", "dcs", "file_year", "file_month"],
         "baselines": ["facility", "dcs", "season"],
-        "flagged": ["facility", "dcs", "date", "shift", "file_year", "file_month", "diagnosis"],
+        "flagged": ["facility", "serial_no", "dcs", "date", "shift", "file_year", "file_month", "diagnosis"],
         "daily_summary": ["facility", "date", "shift"],
         "severity": ["facility", "dcs", "file_year", "file_month"],
         "month_summaries": ["facility", "file_year", "file_month"],
